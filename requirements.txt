@@ -1,10 +1,13 @@
 pandas==2.2.2
 streamlit==1.35.0
+plotly
 openpyxl
 rapidfuzz
+networkx
 geopandas
 shapely
 pyproj
 pyogrio
 requests
 pydeck
+pytest

@@ -1,21 +1,106 @@
+import argparse
 import pandas as pd
 import os
 import re
 import math
 import sys
 import json
+import time
+from datetime import datetime, timezone
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import unicodedata
 from rapidfuzz import process, fuzz
 
 try:
     import geopandas as gpd
     import requests
-    from shapely.geometry import Point, LineString, MultiLineString
-    from shapely.ops import linemerge, nearest_points, substring, transform as shp_transform
+    from shapely.geometry import Point
+    from shapely.ops import transform as shp_transform
     from pyproj import Transformer
+    try:
+        from road_graph import RoadGraph
+    except ImportError:
+        from .road_graph import RoadGraph
 except ImportError:
     gpd = None
     requests = None
+    RoadGraph = None
+
+_ROUTE_WORKER_GRAPH = None
+
+
+def _init_route_worker(graph):
+    global _ROUTE_WORKER_GRAPH
+    _ROUTE_WORKER_GRAPH = graph
+    _ROUTE_WORKER_GRAPH._rebuild_spatial_index()
+
+
+def _route_worker(task):
+    index, values = task
+    via, de, ate, reference, expected, codlog = values
+    before_intersections = set(_ROUTE_WORKER_GRAPH.intersection_cache)
+    before_resolutions = set(_ROUTE_WORKER_GRAPH.resolution_cache)
+    before_paths = set(_ROUTE_WORKER_GRAPH.path_cache)
+    routed = _ROUTE_WORKER_GRAPH.route(
+        via, de, ate, reference=reference, expected_length=expected, codlog=codlog
+    )
+    return index, routed, {
+        'intersections': {k: _ROUTE_WORKER_GRAPH.intersection_cache[k] for k in set(_ROUTE_WORKER_GRAPH.intersection_cache) - before_intersections},
+        'resolutions': {k: _ROUTE_WORKER_GRAPH.resolution_cache[k] for k in set(_ROUTE_WORKER_GRAPH.resolution_cache) - before_resolutions},
+        'paths': {k: _ROUTE_WORKER_GRAPH.path_cache[k] for k in set(_ROUTE_WORKER_GRAPH.path_cache) - before_paths},
+    }
+
+
+def _failure_diagnosis(status, metadata, row):
+    """Converte o estado técnico da rota em uma causa operacional explícita."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    via_found = bool(metadata.get('rua_via_resolvida'))
+    codlog_status = metadata.get('codlog_status', 'NAO_INFORMADO')
+    method_via = metadata.get('method_via', '')
+    method_de = metadata.get('method_de', '')
+    method_ate = metadata.get('method_ate', '')
+
+    if not via_found:
+        if codlog_status == 'INEXISTENTE':
+            reason = 'CODLOG_INEXISTENTE'
+            detail = 'CODLOG informado não foi encontrado no índice GeoSampa e a via também não foi resolvida.'
+        elif method_via in ('SEM_NOME', 'SEM_GEOMETRIA'):
+            reason = 'FUZZY_NAO_RESOLVEU' if method_via == 'SEM_GEOMETRIA' else 'SEM_RUA'
+            detail = 'A via não foi encontrada por nome exato nem pelo limite de resolução fuzzy.'
+        else:
+            reason = 'SEM_RUA'
+            detail = 'A via principal não possui correspondência no GeoSampa.'
+    elif status in ('SEM_RUA_DE', 'SEM_RUA_ATE'):
+        campo = 'De' if status == 'SEM_RUA_DE' else 'Até'
+        method = method_de if campo == 'De' else method_ate
+        reason = 'FUZZY_NAO_RESOLVEU' if method == 'SEM_GEOMETRIA' else 'SEM_RUA'
+        detail = f'O logradouro de referência "{campo}" não foi resolvido no GeoSampa.'
+    elif status == 'SEM_INTERSECAO_DE':
+        reason = 'SEM_INTERSECAO_DE'
+        detail = 'A via foi encontrada, mas não há interseção topológica com o logradouro informado em De.'
+    elif status == 'SEM_INTERSECAO_ATE':
+        reason = 'SEM_INTERSECAO_ATE'
+        detail = 'A via foi encontrada, mas não há interseção topológica com o logradouro informado em Até.'
+    elif status == 'SEM_CAMINHO':
+        reason = 'SEM_CAMINHO'
+        detail = 'As interseções foram encontradas, porém os nós pertencem a componentes desconectados ou não há caminho válido.'
+    elif status in ('SEM_GEOMETRIA', 'GEOMETRIA_INVALIDA'):
+        reason = 'GEOMETRIA_INVALIDA'
+        detail = 'A rota foi resolvida, mas a geometria final ficou vazia ou inválida.'
+    else:
+        reason = 'OUTROS'
+        detail = f'Falha não classificada no estado técnico {status!r}.'
+
+    evidence = (
+        f'via_resolvida={metadata.get("rua_via_resolvida") or "NÃO"}; '
+        f'segmentos_via={metadata.get("segment_count_via", 0)}; '
+        f'interseções_de={metadata.get("intersection_count_de", 0)}; '
+        f'interseções_ate={metadata.get("intersection_count_ate", 0)}; '
+        f'componente={"SIM" if metadata.get("component_connected") else "NÃO"}; '
+        f'caminho={"SIM" if metadata.get("path_found") else "NÃO"}; '
+        f'métodos=via:{method_via or "-"},de:{method_de or "-"},ate:{method_ate or "-"}'
+    )
+    return reason, f'{detail} Evidências: {evidence}'
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -26,6 +111,15 @@ RAW_DIR = os.path.join(PROJECT_DIR, 'data', 'raw')
 PROCESSED_DIR = os.path.join(PROJECT_DIR, 'data', 'processed')
 CACHE_DIR = os.path.join(PROJECT_DIR, 'data', 'cache')
 GEOSAMPA_SEGMENTOS = os.path.join(CACHE_DIR, 'geosampa_segmento_logradouro.geojson')
+PIPELINE_RUN_PATH = os.path.join(PROCESSED_DIR, 'pipeline_run.json')
+
+# Códigos persistidos sem elementos visuais. Rótulos, cores e ícones pertencem
+# à interface; CSVs antigos com emojis seguem legíveis no dashboard.
+SITUACAO_CONCLUIDO = 'CONCLUIDO'
+SITUACAO_PLANEJADO = 'PLANEJADO'
+SITUACAO_EM_ANDAMENTO = 'EM_ANDAMENTO'
+SITUACAO_SEM_COBERTURA = 'SEM_COBERTURA'
+SITUACAO_REVISAO = 'REVISAO'
 
 # ─────────────────────────────────────────
 # NORMALIZAÇÃO DE NOME DE RUA
@@ -72,6 +166,11 @@ _ABREVIACOES = {
     r'\bEMB\b': 'EMBAIXADOR',
 }
 
+_ALIASES_LOGRADOURO = {
+    'GUACURUS': 'GUAICURUS',
+    'AVENIDA DOS BANDEIRANTES': 'BANDEIRANTES',
+}
+
 
 def normalizar_cep(valor) -> str:
     if not isinstance(valor, str):
@@ -101,7 +200,57 @@ def normalizar_rua(nome: str) -> str:
     for padrao, substituto in _ABREVIACOES.items():
         nome = re.sub(padrao, substituto, nome)
     nome = re.sub(r'\s+', ' ', nome).strip()
+    nome = _ALIASES_LOGRADOURO.get(nome, nome)
     return nome
+
+
+def eh_toda_extensao(valor) -> bool:
+    valor_norm = normalizar_rua(valor)
+    return any(termo in valor_norm for termo in (
+        'TODA EXTENSAO',
+        'TODA A EXTENSAO',
+        'EM TODA EXTENSAO',
+    ))
+
+
+def classificar_situacao(status_recape, metodo_match: str) -> str:
+    """Classifica o resultado operacional sem alterar as regras de match.
+
+    ``REVISAO`` é reservado para decisões humanas na camada de produto. O ETL
+    mantém a classificação histórica: match por nome/CEP/coordenada não muda o
+    estado de execução do recape associado.
+    """
+    if metodo_match == 'SEM_COBERTURA':
+        return SITUACAO_SEM_COBERTURA
+    status = str(status_recape or '').strip().upper()
+    if status == 'CONCLUIDO':
+        return SITUACAO_CONCLUIDO
+    if status == 'PLANEJADO':
+        return SITUACAO_PLANEJADO
+    return SITUACAO_EM_ANDAMENTO
+
+
+def calcular_cobertura(cruzamento: pd.DataFrame) -> dict:
+    """Retorna contagens de cobertura, inclusive para DataFrames vazios."""
+    total = int(len(cruzamento))
+    if total == 0 or 'metodo_match' not in cruzamento.columns:
+        return {'total': total, 'com_cobertura': 0, 'sem_cobertura': total, 'cobertura_pct': 0.0}
+    com_cobertura = int(cruzamento['metodo_match'].fillna('SEM_COBERTURA').ne('SEM_COBERTURA').sum())
+    return {
+        'total': total,
+        'com_cobertura': com_cobertura,
+        'sem_cobertura': total - com_cobertura,
+        'cobertura_pct': com_cobertura / total * 100,
+    }
+
+
+def salvar_pipeline_run(payload: dict) -> None:
+    """Persiste o estado da execução atual sem inventar histórico de runs."""
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    temporary_path = f'{PIPELINE_RUN_PATH}.tmp'
+    with open(temporary_path, 'w', encoding='utf-8') as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2)
+    os.replace(temporary_path, PIPELINE_RUN_PATH)
 
 
 # ─────────────────────────────────────────
@@ -248,7 +397,13 @@ def baixar_segmentos_geosampa(cache_path=GEOSAMPA_SEGMENTOS, page_size=10000) ->
         print("   ⚠️ geopandas/requests não estão instalados; recapes ficarão sem linhas.")
         return None
     if os.path.exists(cache_path):
-        return cache_path
+        try:
+            with open(cache_path, encoding='utf-8') as stream:
+                cached = json.load(stream)
+            if cached.get('type') == 'FeatureCollection' and cached.get('features'):
+                return cache_path
+        except (OSError, ValueError, AttributeError):
+            pass
 
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     url = 'https://wfs.geosampa.prefeitura.sp.gov.br/geoserver/geoportal/wfs'
@@ -285,145 +440,11 @@ def baixar_segmentos_geosampa(cache_path=GEOSAMPA_SEGMENTOS, page_size=10000) ->
     return cache_path
 
 
-def _componentes_linha(geom):
-    if geom is None or geom.is_empty:
-        return []
-    if isinstance(geom, LineString):
-        return [geom]
-    if isinstance(geom, MultiLineString):
-        geom = linemerge(geom)
-        if isinstance(geom, LineString):
-            return [geom]
-        return list(geom.geoms)
-    return [g for g in getattr(geom, 'geoms', []) if isinstance(g, LineString)]
-
-
-def _unir_linhas(geoms):
-    linhas = []
-    for geom in geoms:
-        linhas.extend(_componentes_linha(geom))
-    if not linhas:
-        return None
-    if len(linhas) == 1:
-        return linhas[0]
-    return linemerge(linhas)
-
-
-def _unir_linhas_locais(geoms, referencia=None, raio_m=2500, limite_sem_raio=40):
-    linhas = []
-    for geom in geoms or []:
-        linhas.extend(_componentes_linha(geom))
-    if not linhas:
-        return None
-    if referencia is not None and not referencia.is_empty:
-        locais = [g for g in linhas if g.distance(referencia) <= raio_m]
-        if not locais:
-            locais = sorted(linhas, key=lambda g: g.distance(referencia))[:limite_sem_raio]
-        linhas = locais
-    return _unir_linhas(linhas)
-
-
-def _unir_linhas_principais(geoms, referencia=None, raio_m=2500, limite_sem_raio=40, fator_minimo=0.65):
-    local = _unir_linhas_locais(geoms, referencia=referencia, raio_m=raio_m, limite_sem_raio=limite_sem_raio)
-    total = _unir_linhas(geoms)
-    if local is None:
-        return total
-    if total is None:
-        return local
-    if local.length < total.length * fator_minimo:
-        return total
-    return local
-
-
-def _linha_mais_representativa(geom, referencia=None):
-    linhas = _componentes_linha(geom)
-    if not linhas:
-        return None
-    if len(linhas) == 1:
-        return linhas[0]
-    if referencia is not None and not referencia.is_empty:
-        return min(linhas, key=lambda g: g.distance(referencia))
-    return max(linhas, key=lambda g: g.length)
-
-
-def _ponto_intersecao(via_geom, outra_geom, referencia=None, tolerancia_m=60):
-    inter = via_geom.intersection(outra_geom)
-    candidatos = []
-    if inter.geom_type == 'Point':
-        candidatos = [inter]
-    elif inter.geom_type == 'MultiPoint':
-        candidatos = list(inter.geoms)
-    elif inter.geom_type == 'GeometryCollection':
-        candidatos = [g for g in inter.geoms if g.geom_type == 'Point']
-
-    if not candidatos:
-        p_via, _ = nearest_points(via_geom, outra_geom)
-        if p_via.distance(outra_geom) <= tolerancia_m:
-            candidatos = [p_via]
-
-    if not candidatos:
-        return None
-    if referencia is not None and not referencia.is_empty:
-        return min(candidatos, key=lambda p: p.distance(referencia))
-    return candidatos[0]
-
-
-def _cortar_linha_entre_pontos(via_geom, p_ini, p_fim, referencia=None, tolerancia_m=60):
-    melhor = None
-    melhor_score = float('inf')
-    for linha in _componentes_linha(via_geom):
-        d_ini = linha.distance(p_ini)
-        d_fim = linha.distance(p_fim)
-        if d_ini > tolerancia_m or d_fim > tolerancia_m:
-            continue
-        score = d_ini + d_fim + (linha.distance(referencia) if referencia is not None else 0)
-        if score < melhor_score:
-            melhor = linha
-            melhor_score = score
-    if melhor is None:
-        return None
-
-    ini = melhor.project(p_ini)
-    fim = melhor.project(p_fim)
-    if abs(ini - fim) < 1:
-        return None
-    if ini > fim:
-        ini, fim = fim, ini
-    return substring(melhor, ini, fim)
-
-
-def _cortar_linha_por_aproximacao(via_geom, de_geom, ate_geom, referencia=None, tolerancia_m=80):
-    melhor = None
-    melhor_score = float('inf')
-    for linha in _componentes_linha(via_geom):
-        p_ini = nearest_points(linha, de_geom)[0]
-        p_fim = nearest_points(linha, ate_geom)[0]
-        d_ini = p_ini.distance(de_geom)
-        d_fim = p_fim.distance(ate_geom)
-        if d_ini > tolerancia_m or d_fim > tolerancia_m:
-            continue
-        score = d_ini + d_fim + (linha.distance(referencia) if referencia is not None else 0)
-        if score < melhor_score:
-            melhor = linha
-            melhor_score = score
-
-    if melhor is None:
-        return None
-
-    p_ini = nearest_points(melhor, de_geom)[0]
-    p_fim = nearest_points(melhor, ate_geom)[0]
-    ini = melhor.project(p_ini)
-    fim = melhor.project(p_fim)
-    if abs(ini - fim) < 1:
-        return None
-    if ini > fim:
-        ini, fim = fim, ini
-    return substring(melhor, ini, fim)
-
-
 def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
-    if gpd is None:
+    if gpd is None or RoadGraph is None:
         return df_recape
+    return df_recape
+    """Implementação anterior mantida apenas como referência histórica.
 
     try:
         cache_path = baixar_segmentos_geosampa()
@@ -476,9 +497,7 @@ def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
             continue
 
         via_linhas = geom_rua(via_nome)
-        de_linhas = geom_rua(de_nome)
-        ate_linhas = geom_rua(ate_nome)
-        if via_linhas is None or de_linhas is None or ate_linhas is None:
+        if via_linhas is None:
             path_cache[cache_key] = (None, 'SEM_RUA_GEOM')
             paths.append(None)
             status_paths.append('SEM_RUA_GEOM')
@@ -489,9 +508,33 @@ def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
             referencia = shp_transform(to_utm, Point(float(row['longitude']), float(row['latitude'])))
 
         via_geom = _unir_linhas_principais(via_linhas, referencia, raio_m=5000, limite_sem_raio=80, fator_minimo=0.5)
+        if via_geom is None:
+            path_cache[cache_key] = (None, 'SEM_RUA_GEOM')
+            paths.append(None)
+            status_paths.append('SEM_RUA_GEOM')
+            continue
+
+        if eh_toda_extensao(de_nome) or eh_toda_extensao(ate_nome):
+            trecho = _linha_mais_representativa(via_geom, referencia)
+            if trecho is not None and not trecho.is_empty:
+                trecho_ll = shp_transform(to_ll, trecho)
+                path = json.dumps([[round(x, 7), round(y, 7)] for x, y in trecho_ll.coords], ensure_ascii=False)
+                path_cache[cache_key] = (path, 'TODA_EXTENSAO')
+                paths.append(path)
+                status_paths.append('TODA_EXTENSAO')
+                continue
+
+        de_linhas = geom_rua(de_nome)
+        ate_linhas = geom_rua(ate_nome)
+        if de_linhas is None or ate_linhas is None:
+            path_cache[cache_key] = (None, 'SEM_RUA_GEOM')
+            paths.append(None)
+            status_paths.append('SEM_RUA_GEOM')
+            continue
+
         de_geom = _unir_linhas_locais(de_linhas, referencia)
         ate_geom = _unir_linhas_locais(ate_linhas, referencia)
-        if via_geom is None or de_geom is None or ate_geom is None:
+        if de_geom is None or ate_geom is None:
             if via_geom is not None:
                 trecho = _linha_mais_representativa(via_geom, referencia)
                 if trecho is not None and not trecho.is_empty:
@@ -538,11 +581,189 @@ def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
     total_linhas = df_recape['path'].notna().sum()
     print(f"   ✅ {total_linhas:,}/{len(df_recape):,} recapes com linha GeoSampa")
     return df_recape
+    """
 
 
 # ─────────────────────────────────────────
 # LEITURA — SGZ CONVIAS
 # ─────────────────────────────────────────
+def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
+    """Roteia todos os recapes sobre um único índice persistente."""
+    started = time.perf_counter()
+    if gpd is None or RoadGraph is None:
+        return df_recape
+    try:
+        cache_path = baixar_segmentos_geosampa()
+        if not cache_path:
+            return df_recape
+        read_started = time.perf_counter()
+        ruas = gpd.read_file(cache_path)
+        if ruas.crs is None:
+            ruas = ruas.set_crs('EPSG:31983')
+        ruas = ruas.to_crs('EPSG:31983')
+        ruas = ruas[ruas.geometry.notna() & ~ruas.geometry.is_empty].copy()
+        print(f'   Leitura GeoJSON: {time.perf_counter() - read_started:.2f}s ({len(ruas):,} segmentos)')
+        graph_path = os.path.join(CACHE_DIR, 'geosampa_road_graph.pkl')
+        graph_started = time.perf_counter()
+        graph = RoadGraph.load_cached(graph_path, cache_path, normalizer=normalizar_rua)
+        if graph is None:
+            print('   Construindo grafo topologico GeoSampa...')
+            graph = RoadGraph.from_geodataframe(
+                ruas, normalizar_rua,
+                progress=lambda done, total: print(f'      índice: {done:,}/{total:,}', end='\r')
+            )
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            graph.save(graph_path, cache_path)
+        else:
+            print('   Grafo GeoSampa carregado do cache.')
+        print(f'   Grafo + caches estruturais: {time.perf_counter() - graph_started:.2f}s')
+    except Exception as exc:
+        print(f'   Nao foi possivel carregar o grafo GeoSampa: {exc}')
+        return df_recape
+
+    to_utm = Transformer.from_crs('EPSG:4326', 'EPSG:31983', always_xy=True).transform
+    to_ll = Transformer.from_crs('EPSG:31983', 'EPSG:4326', always_xy=True).transform
+    result = df_recape.copy()
+    route_started = time.perf_counter()
+    paths, statuses, calculated_lengths, deviations, segment_counts = [], [], [], [], []
+    resolution_methods, failure_categories = [], []
+    failure_rows = []
+    tasks, keys, routed, pending = [], {}, {}, set()
+    for index, row in result.iterrows():
+        via = next((row.get(column) for column in ('logradouro_geosampa', 'via', 'rua_raw')
+                    if isinstance(row.get(column), str) and row.get(column).strip()), '')
+        de, ate = row.get('de', ''), row.get('ate', '')
+        codlog = row.get('codlog') or row.get('cd_codlog') or ''
+        expected = pd.to_numeric(row.get('extensao_m'), errors='coerce')
+        expected_value = float(expected) if pd.notna(expected) else None
+        key = (normalizar_rua(via), normalizar_rua(de), normalizar_rua(ate), str(codlog).strip(), expected_value)
+        keys[index] = key
+        if key in graph.route_cache:
+            routed[index] = graph.route_cache[key]
+            continue
+        if key in pending:
+            continue
+        reference = None
+        if pd.notna(row.get('longitude')) and pd.notna(row.get('latitude')):
+            reference = shp_transform(to_utm, Point(float(row['longitude']), float(row['latitude'])))
+        tasks.append((index, (via, de, ate, reference, expected_value, codlog)))
+        pending.add(key)
+
+    if tasks:
+        workers = min(max(os.cpu_count() or 2, 2), len(tasks), 8)
+        print(f'   Calculando rotas: {len(tasks):,} únicas, {workers} processos...')
+        try:
+            with ProcessPoolExecutor(max_workers=workers, initializer=_init_route_worker, initargs=(graph,)) as pool:
+                futures = [pool.submit(_route_worker, task) for task in tasks]
+                for done, future in enumerate(as_completed(futures), 1):
+                    index, routed_result, cache_delta = future.result()
+                    routed[index] = routed_result
+                    graph.intersection_cache.update(cache_delta['intersections'])
+                    graph.resolution_cache.update(cache_delta['resolutions'])
+                    graph.path_cache.update(cache_delta['paths'])
+                    if done == len(futures) or done % 100 == 0:
+                        print(f'      {done:,}/{len(futures):,} ({done / len(futures) * 100:.1f}%)', end='\r')
+        except Exception as exc:
+            print(f'\n   Processamento multiprocesso indisponível ({exc}); usando processo principal.')
+            for done, (index, values) in enumerate(tasks, 1):
+                routed[index] = graph.route(values[0], values[1], values[2], reference=values[3], expected_length=values[4], codlog=values[5])
+                if done == len(tasks) or done % 100 == 0:
+                    print(f'      {done:,}/{len(tasks):,}', end='\r')
+
+    route_by_key = {keys[index]: routed[index] for index, _ in tasks if index in routed}
+    for index, row in result.iterrows():
+        if index not in routed:
+            routed[index] = route_by_key[keys[index]]
+        geometry, status, metadata = routed[index]
+        path = None
+        length = None
+        deviation = None
+        if geometry is not None:
+            length = float(geometry.length)
+            expected_value = keys[index][-1]
+            if expected_value is not None and expected_value > 0:
+                deviation = abs(length - expected_value) / expected_value * 100
+            geometry_ll = shp_transform(to_ll, geometry)
+            path = json.dumps([[round(x, 7), round(y, 7)] for x, y in geometry_ll.coords], ensure_ascii=False)
+        count = metadata.get('segment_count') if isinstance(metadata, dict) else None
+        resolution_methods.append(metadata.get('method_via') if isinstance(metadata, dict) else None)
+        category = None
+        if geometry is None:
+            reason, detail = _failure_diagnosis(status, metadata, row)
+            category = reason
+            failure_rows.append({
+                'id': row.get('id'),
+                'recurso': row.get('recurso'),
+                'status': row.get('status'),
+                'via': row.get('via'),
+                'de': row.get('de'),
+                'até': row.get('ate'),
+                'logradouro_geosampa': row.get('logradouro_geosampa'),
+                'codlog': row.get('codlog') or row.get('cd_codlog'),
+                'rua_encontrada_no_geosampa': 'sim' if metadata.get('rua_via_resolvida') else 'não',
+                'quantidade_segmentos_encontrados': int(metadata.get('segment_count_via', 0) or 0),
+                'quantidade_intersecoes_de': int(metadata.get('intersection_count_de', 0) or 0),
+                'quantidade_intersecoes_ate': int(metadata.get('intersection_count_ate', 0) or 0),
+                'componente_conectado_encontrado': 'sim' if metadata.get('component_connected') else 'não',
+                'caminho_encontrado': 'sim' if metadata.get('path_found') else 'não',
+                'motivo_final_da_falha': reason,
+                'mensagem_detalhada': detail,
+            })
+        failure_categories.append(category)
+        paths.append(path)
+        statuses.append(status)
+        calculated_lengths.append(length)
+        deviations.append(deviation)
+        segment_counts.append(count)
+    result['path'] = paths
+    result['status_path'] = statuses
+    result['comprimento_path_m'] = calculated_lengths
+    result['desvio_extensao_pct'] = deviations
+    result['segment_count_path'] = segment_counts
+    result['resolucao_via'] = resolution_methods
+    result['categoria_falha'] = failure_categories
+    for index, route_result in routed.items():
+        graph.route_cache[keys[index]] = route_result
+    graph.save(graph_path, cache_path)
+    status_counts = result['status_path'].value_counts(dropna=False).to_dict()
+    failure_reason_names = [
+        'SEM_RUA', 'SEM_INTERSECAO_DE', 'SEM_INTERSECAO_ATE', 'SEM_CAMINHO',
+        'CODLOG_INEXISTENTE', 'GEOMETRIA_INVALIDA', 'FUZZY_NAO_RESOLVEU', 'OUTROS',
+    ]
+    failure_counts = result['categoria_falha'].value_counts(dropna=True).to_dict()
+    report = {
+        'total_recapes': int(len(result)),
+        'com_geometria': int(result['path'].notna().sum()),
+        'cobertura_pct': float(result['path'].notna().mean() * 100) if len(result) else 0.0,
+        'status': {str(k): int(v) for k, v in status_counts.items()},
+        'falhas_por_motivo': {name: int(failure_counts.get(name, 0)) for name in failure_reason_names},
+        'falhas_por_categoria': {str(k): int(v) for k, v in failure_counts.items()},
+        'fuzzy': int((result['resolucao_via'] == 'FUZZY').sum()),
+        'falhas_detalhadas': int(len(failure_rows)),
+    }
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    failure_columns = [
+        'id', 'recurso', 'status', 'via', 'de', 'até', 'logradouro_geosampa', 'codlog',
+        'rua_encontrada_no_geosampa', 'quantidade_segmentos_encontrados',
+        'quantidade_intersecoes_de', 'quantidade_intersecoes_ate',
+        'componente_conectado_encontrado', 'caminho_encontrado',
+        'motivo_final_da_falha', 'mensagem_detalhada',
+    ]
+    pd.DataFrame(failure_rows, columns=failure_columns).to_csv(
+        os.path.join(PROCESSED_DIR, 'recapes_sem_cobertura.csv'),
+        index=False, encoding='utf-8-sig'
+    )
+    with open(os.path.join(PROCESSED_DIR, 'geosampa_coverage_report.json'), 'w', encoding='utf-8') as stream:
+        json.dump(report, stream, ensure_ascii=False, indent=2)
+    print(f'\n   Rotas: {time.perf_counter() - route_started:.2f}s')
+    print(f'   Grafo: {result["path"].notna().sum():,}/{len(result):,} recapes com linha GeoSampa ({result["path"].notna().mean() * 100:.1f}%)')
+    print(f'   Falhas/status: {status_counts}')
+    print(f'   Relatório de cobertura: {report["falhas_por_categoria"]} | fuzzy={report["fuzzy"]}')
+    print(f'   Recapes sem cobertura: {len(failure_rows):,} | CSV: data/processed/recapes_sem_cobertura.csv')
+    print(f'   Tempo total GeoSampa: {time.perf_counter() - started:.2f}s')
+    return result
+
+
 def load_sgz_convias(filename='sgz_convias.csv') -> pd.DataFrame:
     path = os.path.join(RAW_DIR, filename)
     df = pd.read_csv(path, sep='|', encoding='utf-8', dtype=str)
@@ -639,10 +860,11 @@ def load_sgz_156(filename='sgz_156.csv') -> pd.DataFrame:
 # ─────────────────────────────────────────
 def cruzar(df_notif: pd.DataFrame, df_recape: pd.DataFrame,
            fuzzy_threshold: int = 85, dist_threshold_km: float = 0.3,
-           coord_only_threshold_km: float = 0.3,
-           coord_regional_threshold_km: float = 1.0,
-           coord_regional_long_threshold_km: float = 1.5) -> pd.DataFrame:
+           coord_only_threshold_km: float = 0,
+           coord_regional_threshold_km: float = 0,
+           coord_regional_long_threshold_km: float = 0) -> pd.DataFrame:
 
+    crossing_started = time.perf_counter()
     recape_norms = df_recape['rua_norm'].fillna('').tolist()
     indice_espacial = montar_indice_espacial(df_recape)
     indices_por_rua = {}
@@ -651,7 +873,8 @@ def cruzar(df_notif: pd.DataFrame, df_recape: pd.DataFrame,
     melhores_por_rua = {}
 
     resultado = []
-    for _, notif in df_notif.iterrows():
+    total_notificacoes = len(df_notif)
+    for notif_pos, (_, notif) in enumerate(df_notif.iterrows(), 1):
         rua_n  = notif.get('rua_norm', '')
         cep_n  = notif.get('cep', '')
         lat_n  = notif.get('latitude')
@@ -699,7 +922,7 @@ def cruzar(df_notif: pd.DataFrame, df_recape: pd.DataFrame,
                     metodo = 'NOME'
                     score  = best[1]
 
-        if match_recape is None:
+        if match_recape is None and coord_only_threshold_km > 0:
             idx_proximo, dist = recape_mais_proximo(
                 lat_n, lon_n, indice_espacial, limite_km=coord_only_threshold_km
             )
@@ -708,7 +931,7 @@ def cruzar(df_notif: pd.DataFrame, df_recape: pd.DataFrame,
                 metodo = 'COORD_PROXIMA'
                 dist_recape = dist
 
-        if match_recape is None:
+        if match_recape is None and coord_regional_threshold_km > 0:
             idx_proximo, dist = recape_mais_proximo(
                 lat_n,
                 lon_n,
@@ -722,7 +945,7 @@ def cruzar(df_notif: pd.DataFrame, df_recape: pd.DataFrame,
                 metodo = 'COORD_REGIONAL'
                 dist_recape = dist
 
-        if match_recape is None:
+        if match_recape is None and coord_regional_long_threshold_km > 0:
             idx_proximo, dist = recape_mais_proximo(
                 lat_n,
                 lon_n,
@@ -767,17 +990,13 @@ def cruzar(df_notif: pd.DataFrame, df_recape: pd.DataFrame,
         }
 
         # ── CLASSIFICAÇÃO OPERACIONAL ─────────────────────────────────────
-        if metodo == 'SEM_COBERTURA':
-            linha['situacao'] = '🔴 Sem cobertura'
-        elif linha['status_recape'] == 'CONCLUIDO':
-            linha['situacao'] = '✅ Recape concluído'
-        elif linha['status_recape'] == 'PLANEJADO':
-            linha['situacao'] = '⚠️ Recape planejado'
-        else:
-            linha['situacao'] = '🟡 Em andamento'
+        linha['situacao'] = classificar_situacao(linha['status_recape'], metodo)
 
         resultado.append(linha)
+        if notif_pos == total_notificacoes or notif_pos % 250 == 0:
+            print(f'   Cruzamento: {notif_pos:,}/{total_notificacoes:,} ({notif_pos / max(total_notificacoes, 1) * 100:.1f}%)', end='\r')
 
+    print(f'\n   Tempo cruzamento: {time.perf_counter() - crossing_started:.2f}s')
     return pd.DataFrame(resultado)
 
 
@@ -786,23 +1005,37 @@ def cruzar(df_notif: pd.DataFrame, df_recape: pd.DataFrame,
 # ─────────────────────────────────────────
 def run():
     os.makedirs(PROCESSED_DIR, exist_ok=True)
+    pipeline_started = time.perf_counter()
+    stage_seconds = {}
+    run_timestamp = datetime.now(timezone.utc).isoformat()
 
     print("📂 Carregando recapeamentos...")
+    stage_started = time.perf_counter()
     recape = load_recape()
+    stage_seconds['leitura_recapes'] = round(time.perf_counter() - stage_started, 3)
     print("🧭 Calculando trechos dos recapes via GeoSampa...")
+    stage_started = time.perf_counter()
     recape = enriquecer_recape_com_geosampa(recape)
+    stage_seconds['roteamento_geosampa'] = round(time.perf_counter() - stage_started, 3)
+    stage_started = time.perf_counter()
     recape.to_csv(os.path.join(PROCESSED_DIR, 'recape_clean.csv'), index=False)
+    stage_seconds['persistencia_recapes'] = round(time.perf_counter() - stage_started, 3)
     print(f"   ✅ {len(recape)} registros | status: {recape['status'].value_counts().to_dict()}")
 
     print("📂 Carregando SGZ Convias...")
+    stage_started = time.perf_counter()
     convias = load_sgz_convias()
+    stage_seconds['leitura_convias'] = round(time.perf_counter() - stage_started, 3)
     print(f"   ✅ {len(convias)} notificações")
 
     print("📂 Carregando SGZ 156...")
+    stage_started = time.perf_counter()
     sgz_156 = load_sgz_156()
+    stage_seconds['leitura_sgz_156'] = round(time.perf_counter() - stage_started, 3)
     print(f"   ✅ {len(sgz_156)} OSs")
 
     print("🔗 Unificando notificações...")
+    stage_started = time.perf_counter()
     colunas = ['numero_os','tipo_servico','cep','rua_raw','rua_norm','numero',
                'latitude','longitude','prefeitura_regional','data_recebimento','status','fonte']
     frames_notificacoes = []
@@ -811,18 +1044,123 @@ def run():
         frames_notificacoes.append(frame)
     notificacoes = pd.concat(frames_notificacoes, ignore_index=True)
     notificacoes.to_csv(os.path.join(PROCESSED_DIR, 'notificacoes.csv'), index=False)
+    stage_seconds['normalizacao_e_unificacao'] = round(time.perf_counter() - stage_started, 3)
     print(f"   ✅ {len(notificacoes)} notificações unificadas")
 
     print("🔍 Cruzando notificações × recapeamentos...")
+    stage_started = time.perf_counter()
     cruzamento = cruzar(notificacoes, recape)
     cruzamento.to_csv(os.path.join(PROCESSED_DIR, 'cruzamento.csv'), index=False)
+    stage_seconds['matching_e_persistencia'] = round(time.perf_counter() - stage_started, 3)
 
-    total = len(cruzamento)
-    com_cobertura = cruzamento[cruzamento['metodo_match'] != 'SEM_COBERTURA']
-    print(f"   ✅ {len(com_cobertura)}/{total} notificações com cobertura de recape ({len(com_cobertura)/total*100:.1f}%)")
+    cobertura = calcular_cobertura(cruzamento)
+    cache_path = os.path.join(CACHE_DIR, 'geosampa_road_graph.pkl')
+    cache_version = getattr(RoadGraph, 'CACHE_VERSION', None) if RoadGraph is not None else None
+    run_payload = {
+        'timestamp': run_timestamp,
+        'status': 'SUCCESS',
+        'duration_seconds': round(time.perf_counter() - pipeline_started, 3),
+        'stage_seconds': stage_seconds,
+        'files_processed': ['recape', 'sgz_convias', 'sgz_156'],
+        'counts': {
+            'notificacoes': int(len(notificacoes)),
+            'recapes': int(len(recape)),
+            'geometrias_geradas': int(recape['path'].notna().sum()) if 'path' in recape.columns else 0,
+            'falhas_geometria': int(recape['categoria_falha'].notna().sum()) if 'categoria_falha' in recape.columns else 0,
+            'fuzzy_rotas': int(recape['resolucao_via'].eq('FUZZY').sum()) if 'resolucao_via' in recape.columns else 0,
+            'matches_com_cobertura': cobertura['com_cobertura'],
+        },
+        'coverage_pct': cobertura['cobertura_pct'],
+        'cache': {'road_graph_available': os.path.exists(cache_path), 'version': cache_version},
+        'workers': min(max(os.cpu_count() or 2, 2), max(len(recape), 1), 8),
+        'errors': [],
+    }
+    salvar_pipeline_run(run_payload)
+    print(f"   ✅ {cobertura['com_cobertura']}/{cobertura['total']} notificações com cobertura de recape ({cobertura['cobertura_pct']:.1f}%)")
     print(f"\n✅ Pipeline concluído. Dados em data/processed/")
     return recape, notificacoes, cruzamento
 
 
+def run_street_resolution_audit(argv=None):
+    """Executa somente a camada diagnóstica de logradouros.
+
+    O modo normal continua chamando ``run()``. Esta função não passa pelo
+    enriquecimento/roteamento e não grava ``recape_clean.csv``,
+    ``recapes_processados.csv`` ou qualquer cache do RoadGraph.
+    """
+    try:
+        from street_resolver import (
+            DEFAULT_ALIAS_PATH,
+            DEFAULT_CACHE_PATH,
+            DEFAULT_GEOSAMPA_PATH,
+            DEFAULT_GRAPH_CACHE,
+            run_audit,
+            load_existing_road_graph,
+        )
+    except ImportError:
+        from .street_resolver import (
+            DEFAULT_ALIAS_PATH,
+            DEFAULT_CACHE_PATH,
+            DEFAULT_GEOSAMPA_PATH,
+            DEFAULT_GRAPH_CACHE,
+            run_audit,
+            load_existing_road_graph,
+        )
+
+    started = time.perf_counter()
+    print('Auditoria diagnóstica de resolução de logradouros...')
+    parser = argparse.ArgumentParser(description='Auditoria diagnóstica de logradouros')
+    parser.add_argument('--audit-streets', action='store_true')
+    parser.add_argument('--sample', type=int, default=None)
+    parser.add_argument('--limit', type=int, default=None)
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--reset-cache', action='store_true')
+    parser.add_argument('--audit-streets-reset', action='store_true')
+    parser.add_argument('--skip-route-context', action='store_true')
+    parser.add_argument('--street-only', action='store_true')
+    parser.add_argument('--checkpoint-every', type=int, default=None)
+    parser.add_argument('--output-dir', default=str(PROCESSED_DIR))
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    recape = load_recape()
+    limit = args.sample if args.sample is not None else args.limit
+    if limit is not None:
+        recape = recape.head(max(limit, 0)).copy()
+    print(f'   Recapes carregados: {len(recape):,}')
+    graph_started = time.perf_counter()
+    graph = load_existing_road_graph(
+        graph_cache_path=DEFAULT_GRAPH_CACHE,
+        source_path=DEFAULT_GEOSAMPA_PATH,
+        normalizer=normalizar_rua,
+    )
+    print(f'   Grafo somente-leitura carregado: {time.perf_counter() - graph_started:.2f}s')
+    report = run_audit(
+        recape,
+        graph,
+        output_dir=args.output_dir,
+        aliases_path=DEFAULT_ALIAS_PATH,
+        cache_path=DEFAULT_CACHE_PATH,
+        source_path=DEFAULT_GEOSAMPA_PATH,
+        street_only=args.street_only,
+        skip_route_context=args.skip_route_context,
+        resume=True,
+        reset_checkpoint=args.audit_streets_reset,
+        reset_cache=args.reset_cache or args.audit_streets_reset,
+        checkpoint_every=args.checkpoint_every,
+        load_graph_seconds=time.perf_counter() - graph_started,
+    )
+    print(
+        f'   Resultado: HIGH={report["recommended_high"]:,}, '
+        f'MEDIUM={report["recommended_medium"]:,}, '
+        f'LOW={report["recommended_low"]:,}, '
+        f'UNRESOLVED={report["unresolved"]:,}, '
+        f'divergências={report["divergences"]:,}'
+    )
+    print(f'   Tempo total da auditoria: {time.perf_counter() - started:.2f}s')
+    return report
+
+
 if __name__ == '__main__':
-    run()
+    if '--audit-streets' in sys.argv or os.environ.get('STREET_RESOLUTION_AUDIT') == '1':
+        run_street_resolution_audit()
+    else:
+        run()
