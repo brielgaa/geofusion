@@ -6,6 +6,7 @@ import math
 import sys
 import json
 import time
+import shutil
 from datetime import datetime, timezone
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import unicodedata
@@ -25,6 +26,11 @@ except ImportError:
     gpd = None
     requests = None
     RoadGraph = None
+
+try:
+    from street_resolution_overrides import load_human_review_overrides, HumanReviewOverrides
+except ImportError:
+    from .street_resolution_overrides import load_human_review_overrides, HumanReviewOverrides
 
 _ROUTE_WORKER_GRAPH = None
 
@@ -54,6 +60,8 @@ def _route_worker(task):
 def _failure_diagnosis(status, metadata, row):
     """Converte o estado técnico da rota em uma causa operacional explícita."""
     metadata = metadata if isinstance(metadata, dict) else {}
+    if status == 'HUMAN_UNRESOLVED' or metadata.get('human_review_decision') == 'MARCAR_COMO_NAO_RESOLVIDO':
+        return 'HUMAN_UNRESOLVED', 'Decisão humana marcou o recape como não resolvido; fuzzy automático foi bloqueado.'
     via_found = bool(metadata.get('rua_via_resolvida'))
     codlog_status = metadata.get('codlog_status', 'NAO_INFORMADO')
     method_via = metadata.get('method_via', '')
@@ -112,6 +120,10 @@ PROCESSED_DIR = os.path.join(PROJECT_DIR, 'data', 'processed')
 CACHE_DIR = os.path.join(PROJECT_DIR, 'data', 'cache')
 GEOSAMPA_SEGMENTOS = os.path.join(CACHE_DIR, 'geosampa_segmento_logradouro.geojson')
 PIPELINE_RUN_PATH = os.path.join(PROCESSED_DIR, 'pipeline_run.json')
+DEFAULT_HUMAN_REVIEW_PATH = os.path.join(PROCESSED_DIR, 'street_resolution_human_review.csv')
+HUMAN_OVERRIDE_REPORT_PATH = os.path.join(PROCESSED_DIR, 'street_resolution_override_report.json')
+HUMAN_OVERRIDE_ERRORS_PATH = os.path.join(PROCESSED_DIR, 'street_resolution_override_errors.csv')
+HUMAN_OVERRIDE_SHADOW_PATH = os.path.join(PROCESSED_DIR, 'street_resolution_override_shadow.csv')
 
 # Códigos persistidos sem elementos visuais. Rótulos, cores e ícones pertencem
 # à interface; CSVs antigos com emojis seguem legíveis no dashboard.
@@ -244,13 +256,20 @@ def calcular_cobertura(cruzamento: pd.DataFrame) -> dict:
     }
 
 
-def salvar_pipeline_run(payload: dict) -> None:
+def salvar_pipeline_run(payload: dict, path: str = PIPELINE_RUN_PATH) -> None:
     """Persiste o estado da execução atual sem inventar histórico de runs."""
     os.makedirs(PROCESSED_DIR, exist_ok=True)
-    temporary_path = f'{PIPELINE_RUN_PATH}.tmp'
+    temporary_path = f'{path}.tmp'
     with open(temporary_path, 'w', encoding='utf-8') as stream:
         json.dump(payload, stream, ensure_ascii=False, indent=2)
-    os.replace(temporary_path, PIPELINE_RUN_PATH)
+    os.replace(temporary_path, path)
+
+
+def _atomic_write_dataframe(frame: pd.DataFrame, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary_path = f'{path}.tmp'
+    frame.to_csv(temporary_path, index=False, encoding='utf-8-sig')
+    os.replace(temporary_path, path)
 
 
 # ─────────────────────────────────────────
@@ -587,8 +606,15 @@ def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────
 # LEITURA — SGZ CONVIAS
 # ─────────────────────────────────────────
-def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
+def enriquecer_recape_com_geosampa(
+    df_recape: pd.DataFrame,
+    human_review_mode: str = 'off',
+    human_review_path=None,
+    output_suffix: str = '',
+) -> pd.DataFrame:
     """Roteia todos os recapes sobre um único índice persistente."""
+    if human_review_mode not in ('off', 'shadow', 'apply'):
+        raise ValueError(f'Modo de revisão humana inválido: {human_review_mode}')
     started = time.perf_counter()
     if gpd is None or RoadGraph is None:
         return df_recape
@@ -624,16 +650,65 @@ def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
     to_utm = Transformer.from_crs('EPSG:4326', 'EPSG:31983', always_xy=True).transform
     to_ll = Transformer.from_crs('EPSG:31983', 'EPSG:4326', always_xy=True).transform
     result = df_recape.copy()
+    overrides = None
+    overrides_by_index = {}
+    if human_review_mode in ('shadow', 'apply'):
+        overrides = load_human_review_overrides(
+            graph, normalizar_rua, review_path=human_review_path or DEFAULT_HUMAN_REVIEW_PATH
+        )
+        for index, row in result.iterrows():
+            overrides_by_index[index] = overrides.for_record(row)
+        related = sum(item is not None for item in overrides_by_index.values())
+        print(f'   Revisoes humanas: {overrides.total_reviews_loaded:,} carregadas; {related:,} relacionadas por registro')
+        for column in (
+            'human_review_applied', 'human_review_decision', 'human_review_source', 'human_review_key',
+            'human_reviewed_at', 'human_reviewed_by', 'human_resolved_street', 'human_resolved_codlog',
+            'human_override_valid', 'human_override_validation_reason', 'street_resolution_method_final',
+            'street_resolution_source_final',
+        ):
+            result[column] = False if column in ('human_review_applied', 'human_override_valid') else None
     route_started = time.perf_counter()
     paths, statuses, calculated_lengths, deviations, segment_counts = [], [], [], [], []
     resolution_methods, failure_categories = [], []
+    final_methods, final_sources = [], []
     failure_rows = []
     tasks, keys, routed, pending = [], {}, {}, set()
+    effective_values = {}
     for index, row in result.iterrows():
         via = next((row.get(column) for column in ('logradouro_geosampa', 'via', 'rua_raw')
                     if isinstance(row.get(column), str) and row.get(column).strip()), '')
         de, ate = row.get('de', ''), row.get('ate', '')
         codlog = row.get('codlog') or row.get('cd_codlog') or ''
+        override = overrides_by_index.get(index)
+        if override is not None:
+            result.at[index, 'human_review_decision'] = override.decision
+            result.at[index, 'human_review_source'] = override.source
+            result.at[index, 'human_review_key'] = override.review_key
+            result.at[index, 'human_reviewed_at'] = override.reviewed_at
+            result.at[index, 'human_reviewed_by'] = override.reviewed_by
+            result.at[index, 'human_resolved_street'] = override.resolved_street
+            result.at[index, 'human_resolved_codlog'] = override.resolved_codlog
+            result.at[index, 'human_override_valid'] = override.valid
+            result.at[index, 'human_override_validation_reason'] = override.validation_reason
+            if human_review_mode == 'apply' and override.valid and override.applicable:
+                if override.block_fuzzy:
+                    keys[index] = ('HUMAN_UNRESOLVED', str(index))
+                    result.at[index, 'human_review_applied'] = True
+                    routed[index] = (None, 'HUMAN_UNRESOLVED', {
+                        'method_via': 'HUMAN_UNRESOLVED', 'human_review_decision': override.decision,
+                        'human_review_source': override.source, 'path_found': False,
+                    })
+                    effective_values[index] = (via, de, ate, codlog, override)
+                    overrides.mark_applied()
+                    continue
+                via = override.resolved_street or via
+                codlog = override.resolved_codlog or ''
+                result.at[index, 'human_review_applied'] = True
+                effective_values[index] = (via, de, ate, codlog, override)
+                overrides.mark_applied()
+            elif human_review_mode == 'shadow' and override.valid and override.applicable:
+                effective_values[index] = (override.resolved_street or via, de, ate, override.resolved_codlog or '', override)
+        effective_values.setdefault(index, (via, de, ate, codlog, override))
         expected = pd.to_numeric(row.get('extensao_m'), errors='coerce')
         expected_value = float(expected) if pd.notna(expected) else None
         key = (normalizar_rua(via), normalizar_rua(de), normalizar_rua(ate), str(codlog).strip(), expected_value)
@@ -671,6 +746,49 @@ def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
                     print(f'      {done:,}/{len(tasks):,}', end='\r')
 
     route_by_key = {keys[index]: routed[index] for index, _ in tasks if index in routed}
+    for index in result.index:
+        if index not in routed and keys.get(index) in route_by_key:
+            routed[index] = route_by_key[keys[index]]
+
+    shadow_rows = []
+    shadow_geometry_possible = 0
+    if human_review_mode == 'shadow' and overrides is not None:
+        for index, override in overrides_by_index.items():
+            if override is None:
+                continue
+            current_route = routed.get(index)
+            current_geometry = current_route[0] if current_route else None
+            override_geometry = None
+            override_status = 'NAO_APLICAVEL'
+            if override.valid and override.applicable:
+                if override.block_fuzzy:
+                    override_status = 'HUMAN_UNRESOLVED'
+                else:
+                    via_h, de_h, ate_h, codlog_h, _ = effective_values[index]
+                    expected_h = pd.to_numeric(result.loc[index].get('extensao_m'), errors='coerce')
+                    expected_h = float(expected_h) if pd.notna(expected_h) else None
+                    reference_h = None
+                    if pd.notna(result.loc[index].get('longitude')) and pd.notna(result.loc[index].get('latitude')):
+                        reference_h = shp_transform(to_utm, Point(float(result.loc[index]['longitude']), float(result.loc[index]['latitude'])))
+                    override_route = graph.route(via_h, de_h, ate_h, reference=reference_h, expected_length=expected_h, codlog=codlog_h)
+                    override_geometry = override_route[0]
+                    override_status = override_route[1]
+            shadow_rows.append({
+                'ID': result.loc[index].get('id'), 'review_key': override.review_key,
+                'resolucao_atual': result.loc[index].get('rua_raw'),
+                'resolucao_humana': override.resolved_street, 'codlog_atual': result.loc[index].get('codlog') or result.loc[index].get('cd_codlog'),
+                'codlog_humano': override.resolved_codlog, 'decisao': override.decision,
+                'override_valido': override.valid, 'motivo': override.validation_reason,
+                'mudaria_resultado': bool(override.valid and override.applicable and (
+                    override.resolved_street != normalizar_rua(result.loc[index].get('rua_raw', '')) or
+                    str(override.resolved_codlog or '') != str(result.loc[index].get('codlog') or result.loc[index].get('cd_codlog') or '')
+                )),
+                'geometria_atual_disponivel': current_geometry is not None,
+                'geometria_com_override_seria_possivel': override_geometry is not None,
+                'status_geometria_override': override_status,
+            })
+        _atomic_write_dataframe(pd.DataFrame(shadow_rows), HUMAN_OVERRIDE_SHADOW_PATH)
+        shadow_geometry_possible = sum(bool(row['geometria_com_override_seria_possivel']) for row in shadow_rows)
     for index, row in result.iterrows():
         if index not in routed:
             routed[index] = route_by_key[keys[index]]
@@ -686,7 +804,19 @@ def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
             geometry_ll = shp_transform(to_ll, geometry)
             path = json.dumps([[round(x, 7), round(y, 7)] for x, y in geometry_ll.coords], ensure_ascii=False)
         count = metadata.get('segment_count') if isinstance(metadata, dict) else None
-        resolution_methods.append(metadata.get('method_via') if isinstance(metadata, dict) else None)
+        technical_method = metadata.get('method_via') if isinstance(metadata, dict) else None
+        resolution_methods.append(technical_method)
+        override = overrides_by_index.get(index)
+        if human_review_mode == 'apply' and override is not None and override.valid and override.applicable:
+            final_method = 'HUMAN_UNRESOLVED' if override.block_fuzzy else (
+                'HUMAN_CHOSEN_CANDIDATE' if override.decision == 'ESCOLHER_OUTRO_CANDIDATO' else 'HUMAN_REVIEW'
+            )
+            final_source = 'HUMAN_REVIEW'
+        else:
+            final_method = technical_method if technical_method in ('CODLOG', 'ALIAS', 'EXATO', 'FUZZY') else 'SEM_RESOLUCAO'
+            final_source = technical_method or 'ROAD_GRAPH'
+        final_methods.append(final_method)
+        final_sources.append(final_source)
         category = None
         if geometry is None:
             reason, detail = _failure_diagnosis(status, metadata, row)
@@ -722,9 +852,13 @@ def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
     result['segment_count_path'] = segment_counts
     result['resolucao_via'] = resolution_methods
     result['categoria_falha'] = failure_categories
+    if human_review_mode in ('shadow', 'apply'):
+        result['street_resolution_method_final'] = final_methods
+        result['street_resolution_source_final'] = final_sources
     for index, route_result in routed.items():
         graph.route_cache[keys[index]] = route_result
-    graph.save(graph_path, cache_path)
+    if human_review_mode != 'shadow':
+        graph.save(graph_path, cache_path)
     status_counts = result['status_path'].value_counts(dropna=False).to_dict()
     failure_reason_names = [
         'SEM_RUA', 'SEM_INTERSECAO_DE', 'SEM_INTERSECAO_ATE', 'SEM_CAMINHO',
@@ -750,11 +884,27 @@ def enriquecer_recape_com_geosampa(df_recape: pd.DataFrame) -> pd.DataFrame:
         'motivo_final_da_falha', 'mensagem_detalhada',
     ]
     pd.DataFrame(failure_rows, columns=failure_columns).to_csv(
-        os.path.join(PROCESSED_DIR, 'recapes_sem_cobertura.csv'),
+        os.path.join(PROCESSED_DIR, f'recapes_sem_cobertura{output_suffix}.csv'),
         index=False, encoding='utf-8-sig'
     )
-    with open(os.path.join(PROCESSED_DIR, 'geosampa_coverage_report.json'), 'w', encoding='utf-8') as stream:
+    with open(os.path.join(PROCESSED_DIR, f'geosampa_coverage_report{output_suffix}.json'), 'w', encoding='utf-8') as stream:
         json.dump(report, stream, ensure_ascii=False, indent=2)
+    if overrides is not None:
+        human_applied = result['human_review_applied'].fillna(False).astype(bool)
+        valid_applicable = result['human_override_valid'].fillna(False).astype(bool) & result['human_review_decision'].isin((
+            'APROVAR_RECOMENDACAO', 'ESCOLHER_OUTRO_CANDIDATO', 'MARCAR_COMO_NAO_RESOLVIDO'
+        ))
+        resolved_by_human = human_applied & result['path'].notna()
+        overrides.write_report(
+            HUMAN_OVERRIDE_REPORT_PATH,
+            HUMAN_OVERRIDE_ERRORS_PATH,
+            recapes_resolved_by_human_review=int(resolved_by_human.sum()),
+            recapes_resolved_by_fallback=int(result['path'].notna().sum()) - int(resolved_by_human.sum()),
+            recapes_unresolved_after_all_methods=int(result['path'].isna().sum()),
+            overrides_would_apply=int(valid_applicable.sum()),
+            recapes_would_be_resolved_by_human_review=int(shadow_geometry_possible),
+            human_review_mode=human_review_mode,
+        )
     print(f'\n   Rotas: {time.perf_counter() - route_started:.2f}s')
     print(f'   Grafo: {result["path"].notna().sum():,}/{len(result):,} recapes com linha GeoSampa ({result["path"].notna().mean() * 100:.1f}%)')
     print(f'   Falhas/status: {status_counts}')
@@ -1003,22 +1153,49 @@ def cruzar(df_notif: pd.DataFrame, df_recape: pd.DataFrame,
 # ─────────────────────────────────────────
 # PIPELINE PRINCIPAL
 # ─────────────────────────────────────────
-def run():
+def _backup_apply_outputs() -> list[str]:
+    """Preserva saídas oficiais antes da primeira execução com overrides."""
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    paths = [
+        os.path.join(PROCESSED_DIR, 'recape_clean.csv'),
+        os.path.join(PROCESSED_DIR, 'notificacoes.csv'),
+        os.path.join(PROCESSED_DIR, 'cruzamento.csv'),
+        os.path.join(PROCESSED_DIR, 'recapes_sem_cobertura.csv'),
+        os.path.join(PROCESSED_DIR, 'geosampa_coverage_report.json'),
+        PIPELINE_RUN_PATH,
+    ]
+    backups = []
+    for path in paths:
+        if os.path.exists(path):
+            backup = f'{path}.human_review_backup_{timestamp}'
+            shutil.copy2(path, backup)
+            backups.append(backup)
+    return backups
+
+
+def run(human_review_mode: str = 'off', human_review_path=None):
     os.makedirs(PROCESSED_DIR, exist_ok=True)
     pipeline_started = time.perf_counter()
     stage_seconds = {}
     run_timestamp = datetime.now(timezone.utc).isoformat()
 
+    output_suffix = '_human_review_shadow' if human_review_mode == 'shadow' else ''
+    if human_review_mode == 'apply':
+        backups = _backup_apply_outputs()
+        print(f'   Backups de segurança: {len(backups)} arquivos')
     print("📂 Carregando recapeamentos...")
     stage_started = time.perf_counter()
     recape = load_recape()
     stage_seconds['leitura_recapes'] = round(time.perf_counter() - stage_started, 3)
     print("🧭 Calculando trechos dos recapes via GeoSampa...")
     stage_started = time.perf_counter()
-    recape = enriquecer_recape_com_geosampa(recape)
+    recape = enriquecer_recape_com_geosampa(
+        recape, human_review_mode=human_review_mode, human_review_path=human_review_path,
+        output_suffix=output_suffix,
+    )
     stage_seconds['roteamento_geosampa'] = round(time.perf_counter() - stage_started, 3)
     stage_started = time.perf_counter()
-    recape.to_csv(os.path.join(PROCESSED_DIR, 'recape_clean.csv'), index=False)
+    recape.to_csv(os.path.join(PROCESSED_DIR, f'recape_clean{output_suffix}.csv'), index=False)
     stage_seconds['persistencia_recapes'] = round(time.perf_counter() - stage_started, 3)
     print(f"   ✅ {len(recape)} registros | status: {recape['status'].value_counts().to_dict()}")
 
@@ -1043,14 +1220,14 @@ def run():
         frame = origem.reindex(columns=colunas).dropna(axis=1, how='all')
         frames_notificacoes.append(frame)
     notificacoes = pd.concat(frames_notificacoes, ignore_index=True)
-    notificacoes.to_csv(os.path.join(PROCESSED_DIR, 'notificacoes.csv'), index=False)
+    notificacoes.to_csv(os.path.join(PROCESSED_DIR, f'notificacoes{output_suffix}.csv'), index=False)
     stage_seconds['normalizacao_e_unificacao'] = round(time.perf_counter() - stage_started, 3)
     print(f"   ✅ {len(notificacoes)} notificações unificadas")
 
     print("🔍 Cruzando notificações × recapeamentos...")
     stage_started = time.perf_counter()
     cruzamento = cruzar(notificacoes, recape)
-    cruzamento.to_csv(os.path.join(PROCESSED_DIR, 'cruzamento.csv'), index=False)
+    cruzamento.to_csv(os.path.join(PROCESSED_DIR, f'cruzamento{output_suffix}.csv'), index=False)
     stage_seconds['matching_e_persistencia'] = round(time.perf_counter() - stage_started, 3)
 
     cobertura = calcular_cobertura(cruzamento)
@@ -1075,7 +1252,8 @@ def run():
         'workers': min(max(os.cpu_count() or 2, 2), max(len(recape), 1), 8),
         'errors': [],
     }
-    salvar_pipeline_run(run_payload)
+    pipeline_run_path = PIPELINE_RUN_PATH if human_review_mode != 'shadow' else os.path.join(PROCESSED_DIR, 'pipeline_run_human_review_shadow.json')
+    salvar_pipeline_run(run_payload, pipeline_run_path)
     print(f"   ✅ {cobertura['com_cobertura']}/{cobertura['total']} notificações com cobertura de recape ({cobertura['cobertura_pct']:.1f}%)")
     print(f"\n✅ Pipeline concluído. Dados em data/processed/")
     return recape, notificacoes, cruzamento
@@ -1162,5 +1340,19 @@ def run_street_resolution_audit(argv=None):
 if __name__ == '__main__':
     if '--audit-streets' in sys.argv or os.environ.get('STREET_RESOLUTION_AUDIT') == '1':
         run_street_resolution_audit()
+    elif '--audit-route-geometries' in sys.argv or '--route-geometry-shadow' in sys.argv:
+        # A auditoria de geometrias e deliberadamente isolada do pipeline oficial.
+        # Remover apenas o sinalizador de despacho para que o modulo possa tratar
+        # os seus proprios argumentos (sample, resume, only-failure etc.).
+        try:
+            from route_geometry_audit import main as run_route_geometry_audit
+        except ImportError:
+            from .route_geometry_audit import main as run_route_geometry_audit
+        audit_args = [argument for argument in sys.argv[1:] if argument not in {'--audit-route-geometries', '--route-geometry-shadow'}]
+        run_route_geometry_audit(audit_args)
+    elif '--human-review-shadow' in sys.argv:
+        run(human_review_mode='shadow')
+    elif '--apply-human-reviews' in sys.argv:
+        run(human_review_mode='apply')
     else:
         run()

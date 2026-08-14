@@ -32,6 +32,41 @@ Thumbs.db
 data/raw/
 data/processed/
 data/cache/
+data/**/tmp/
+data/**/*.tmp
+data/**/*.pending.*
+data/**/*backup*
+
+# Runtime and generated artifacts outside data/
+*.log
+*.out.log
+*.err.log
+*.sqlite
+*.sqlite3
+*checkpoint*.json
+checkpoints/
+**/checkpoints/
+outputs/
+**/outputs/
+artifacts/
+**/artifacts/
+exports/
+**/exports/
+tmp/
+**/tmp/
+cache/
+**/cache/
+debug/
+**/debug/
+screenshots/debug/
+
+# Local reports, exports, and platform artifacts
+*.bak
+*.backup
+*.pending.*
+*.orig
+OneDriveTemp/
+~$*
 
 # Local notebooks and exports
 .ipynb_checkpoints/

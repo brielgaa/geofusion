@@ -1,82 +1,79 @@
 from __future__ import annotations
 
-import pandas as pd
 import streamlit as st
 
-from dashboard.components.cards import metric_card, page_header
-from dashboard.components.charts import render_coverage_waterfall, render_match_sankey, render_regional_ranking, render_temporal_coverage
-from dashboard.components.empty_states import empty_state
-from dashboard.services.data_loader import AppData
-from dashboard.services.metrics import coverage_delta, coverage_metrics, coverage_waterfall, monthly_coverage, prepare_audit_records, regional_criticality
+from dashboard.components.cards import page_header
+from dashboard.components.operational_ui import horizontal_bars, metric_row, section_title, status_badge
+from dashboard.services.operational_dashboard import OperationalContext, REFERENCE_DATE
 from dashboard.utils.formatting import numero, percentual
 
 
-def render(data: AppData) -> None:
-    records = prepare_audit_records(data.cruzamento)
-    page_header("Visão geral", "Cobertura geoespacial, qualidade de correspondência e áreas que exigem investigação.", "Operação diária")
-    if records.empty:
-        empty_state("Dados de cruzamento indisponíveis", "Rode python src/transform.py para gerar os artefatos processados.")
+def _count(frame, column: str, value: str) -> int:
+    return int(frame[column].eq(value).sum()) if column in frame.columns else 0
+
+
+def render(context: OperationalContext) -> None:
+    frame = context.recapes
+    page_header(
+        "Home",
+        "Leitura operacional de recapes, proteção temporal e qualidade geométrica do acervo GeoFusion.",
+        "Operational dashboard",
+    )
+    if frame.empty:
+        st.error("Não foi possível carregar recape_clean.csv.")
         return
 
-    metrics = coverage_metrics(records)
-    delta = coverage_delta(records)
-    updated = data.updated_at.strftime("%d/%m/%Y %H:%M") if data.updated_at is not None else "não disponível"
-    quality = "Em atenção" if metrics["confirmed_pct"] < 70 else "Saudável"
-    st.caption(f"Dados atualizados em {updated} · {numero(metrics['total'])} registros · qualidade da última leitura: {quality}")
+    total = len(frame)
+    official = _count(frame, "quality_code", "OFFICIAL")
+    shadow = int(frame["quality_code"].isin(["SHADOW_HIGH", "SHADOW_MEDIUM"]).sum())
+    estimated = _count(frame, "quality_code", "ESTIMATED")
+    unresolved = _count(frame, "quality_code", "UNRESOLVED")
+    active = _count(frame, "protection_status", "ACTIVE")
+    expiring = _count(frame, "protection_status", "EXPIRING_SOON")
+    unknown = _count(frame, "protection_status", "UNKNOWN_DATE")
 
-    primary, definition = st.columns([2, 1], gap="large")
-    with primary:
-        delta_text = f"{delta:+.1f} p.p. vs. mês anterior".replace(".", ",") if delta is not None else None
-        metric_card(
-            "Cobertura confirmada",
-            percentual(metrics["confirmed_pct"]),
-            f"{numero(metrics['confirmed'])} casos com correspondência que não exige revisão manual.",
-            primary=True,
-            delta=delta_text,
-            help_text="Percentual de notificações com match encontrado por regra forte e sem sinalização de revisão.",
-        )
-    with definition:
-        metric_card(
-            "Leitura do indicador",
-            numero(metrics["found"]),
-            f"{numero(metrics['review'])} matches exigem revisão; {numero(metrics['no_coverage'])} ficaram sem cobertura.",
-            help_text="Match encontrado inclui correspondências que ainda precisam de confirmação humana.",
-        )
+    st.caption(f"{numero(total)} recapes indexados · data de referência da proteção: {REFERENCE_DATE.strftime('%d/%m/%Y')} · artefatos separados entre oficial e shadow.")
+    metric_row(
+        [
+            ("Recapes no acervo", numero(total), "base operacional carregada"),
+            ("Geometria oficial", percentual(official / total * 100), f"{numero(official)} registros"),
+            ("Shadow / estimada", percentual((shadow + estimated) / total * 100), f"{numero(shadow + estimated)} registros"),
+            ("Proteção ativa", numero(active), f"{numero(expiring)} expiram em até 30 dias"),
+        ],
+        primary_index=1,
+    )
 
-    cards = st.columns(4, gap="medium")
-    card_items = [
-        ("Notificações analisadas", numero(metrics["total"]), "Volume no recorte atual", "Registros gerados pelo cruzamento."),
-        ("Correspondências encontradas", numero(metrics["found"]), percentual(metrics["found_pct"]), "Notificações com algum recape associado."),
-        ("Casos em revisão", numero(metrics["review"]), percentual(metrics["review_pct"]), "Matches de método fraco ou score inferior a 85."),
-        ("Sem cobertura", numero(metrics["no_coverage"]), percentual(metrics["no_coverage_pct"]), "Notificações sem recape associado pela estratégia atual."),
-    ]
-    for column, (label, value, context, help_text) in zip(cards, card_items):
-        with column:
-            metric_card(label, value, context, help_text=help_text)
+    section_title("Entrada operacional", "pesquisa reproduzível")
+    search_col, button_col = st.columns([6, 1], gap="medium")
+    with search_col:
+        search = st.text_input("Buscar via, número ou ID do recape", placeholder="Ex.: AV. ENG BILLINGS 3400 · ID 2097 · -23.55,-46.73", label_visibility="collapsed", key="home_search")
+    with button_col:
+        st.write("")
+        if st.button("Consultar", type="primary", use_container_width=True, key="home_search_button"):
+            st.session_state["query_prefill"] = search
+            st.session_state["pending_navigation"] = "Consulta de Via"
+            st.rerun()
 
-    left, right = st.columns([1.15, 1], gap="large")
+    section_title("Cobertura geométrica", "camadas não substituem a fonte oficial")
+    coverage = frame["quality_code"].value_counts().rename(index={"OFFICIAL": "Oficial", "SHADOW_HIGH": "Shadow · alta", "SHADOW_MEDIUM": "Shadow · média", "ESTIMATED": "Estimada", "UNRESOLVED": "Não resolvida"}).rename_axis("camada").reset_index(name="recapes")
+    coverage["percentual"] = coverage["recapes"].map(lambda value: f"{value / total * 100:.1f}%")
+    left, right = st.columns([1.2, 1], gap="large")
     with left:
-        st.markdown("<div class='section-kicker'>Fluxo de correspondência</div>", unsafe_allow_html=True)
-        render_match_sankey(records)
+        horizontal_bars(list(zip(coverage["camada"], coverage["recapes"])), total)
+        st.markdown(coverage.to_html(index=False, classes="gf-html-table"), unsafe_allow_html=True)
     with right:
-        st.markdown("<div class='section-kicker'>Perdas no roteamento GeoSampa</div>", unsafe_allow_html=True)
-        render_coverage_waterfall(coverage_waterfall(data.coverage_report, data.recapes))
+        st.markdown(f'<div class="detail-panel"><div class="section-kicker">Proteção temporal</div><div style="font-size:1.25rem;font-weight:700;color:#E8EEF7">{numero(active)} ativas</div><div style="color:#8FA1B7;margin:6px 0 14px">{numero(expiring)} expiram em breve · {numero(unknown)} sem data utilizável</div><div>{status_badge("ACTIVE")} &nbsp; {status_badge("EXPIRING_SOON")} &nbsp; {status_badge("UNKNOWN_DATE")}</div></div>', unsafe_allow_html=True)
 
-    trend, regional = st.columns([1.25, 1], gap="large")
-    with trend:
-        st.markdown("<div class='section-kicker'>Cobertura por mês</div>", unsafe_allow_html=True)
-        monthly = monthly_coverage(records)
-        render_temporal_coverage(monthly)
-        if not monthly.empty:
-            table = monthly[["mes", "total", "confirmada", "sem_cobertura", "baixa_confianca", "cobertura_pct"]].copy()
-            table["cobertura_pct"] = table["cobertura_pct"].map(lambda value: f"{value:.1f}%")
-            st.dataframe(table, use_container_width=True, hide_index=True, height=210)
-    with regional:
-        st.markdown("<div class='section-kicker'>Regionais críticas</div>", unsafe_allow_html=True)
-        ranking = regional_criticality(records)
-        render_regional_ranking(ranking)
-        if not ranking.empty:
-            view = ranking[["regional", "total", "sem_cobertura_pct", "baixa_confianca_pct", "status"]].head(10).copy()
-            view["sem_cobertura_pct"] = view["sem_cobertura_pct"].map(lambda value: f"{value:.1f}%")
-            view["baixa_confianca_pct"] = view["baixa_confianca_pct"].map(lambda value: f"{value:.1f}%")
-            st.dataframe(view, use_container_width=True, hide_index=True, height=210)
+    section_title("Próximas ações", "atalhos de operação")
+    cols = st.columns(3)
+    cards = [
+        ("Resolver uma via", "Use rua + número, coordenadas ou ID quando houver ambiguidade.", "Consulta de Via"),
+        ("Revisar proteção", "Priorize recapes que expiram em breve ou têm data desconhecida.", "Proteção de Recapes"),
+        ("Inspecionar cobertura", "Veja a separação entre oficial, shadow e estimada no mapa.", "Mapa"),
+    ]
+    for col, (title, text, page) in zip(cols, cards):
+        with col:
+            st.markdown(f'<div class="detail-panel gf-action-card"><strong>{title}</strong><p style="color:#8FA1B7;font-size:.82rem;min-height:42px">{text}</p></div>', unsafe_allow_html=True)
+            if st.button(f"Abrir · {page}", key=f"home_{page}", use_container_width=True):
+                st.session_state["pending_navigation"] = page
+                st.rerun()

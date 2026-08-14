@@ -1,58 +1,39 @@
 from __future__ import annotations
 
-import pandas as pd
 import streamlit as st
 
 from dashboard.components.cards import page_header
-from dashboard.components.empty_states import empty_state
-from dashboard.services.data_loader import AppData
-from dashboard.utils.formatting import mascarar, numero, percentual, texto
+from dashboard.components.operational_ui import section_title
+from dashboard.services.operational_dashboard import OperationalContext, REFERENCE_DATE
 
 
-def _real_case(recapes: pd.DataFrame) -> pd.Series | None:
-    if recapes.empty or "path" not in recapes.columns:
-        return None
-    rows = recapes[recapes["path"].notna()]
-    return rows.iloc[0] if not rows.empty else None
+def render(context: OperationalContext) -> None:
+    page_header("Sobre", "Contexto, limites de uso e contrato operacional do GeoFusion.", "Produto e método")
+    left, right = st.columns([1.2, 1], gap="large")
+    with left:
+        section_title("O que é o GeoFusion", "primeira camada de produto")
+        st.markdown("""
+        <div class="detail-panel">
+          <p>O GeoFusion transforma artefatos geoespaciais e de recape em uma ferramenta interna de decisão: localizar uma via, entender a superfície, consultar o recape mais recente, acompanhar a proteção e auditar a evidência.</p>
+          <p style="color:#8FA1B7">A interface é operacional. Ela não altera o ETL, não promove geometrias shadow e não conclui automaticamente que uma notificação é violação.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    with right:
+        section_title("Referência desta leitura", "transparência")
+        st.markdown(f"<div class='detail-panel'><div class='gf-detail-label'>Data de referência</div><div class='gf-detail-value'>{REFERENCE_DATE.strftime('%d/%m/%Y')}</div><div class='gf-detail-label'>Registros</div><div class='gf-detail-value'>{len(context.recapes):,} recapes</div><div class='gf-detail-label'>Base</div><div class='gf-detail-value'>recape_clean.csv + índices GeoSampa</div></div>", unsafe_allow_html=True)
 
+    section_title("Princípios de uso", "guardrails explícitos")
+    principles = [
+        ("Oficial primeiro", "Geometria oficial permanece a referência primária. Shadow e estimada aparecem como camadas separadas."),
+        ("Ambiguidade visível", "Uma via com múltiplos segmentos retorna alternativas; nenhuma escolha é feita silenciosamente."),
+        ("Tempo explícito", "Proteção usa data de término/conclusão disponível com uma data de referência explícita."),
+        ("Atenção não é violação", "As notificações associadas usam NEEDS_ATTENTION como estado operacional de revisão."),
+        ("Pesquisa arquivada", "A pesquisa experimental de image geometry permanece em arquivo e não é integrada ao produto operacional."),
+    ]
+    st.markdown("<div class='gf-principles'>", unsafe_allow_html=True)
+    for title, description in principles:
+        st.markdown(f"<div class='gf-principle'><strong>{title}</strong><span>{description}</span></div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-def render(data: AppData) -> None:
-    page_header("Sobre o projeto", "Case técnico de auditoria geoespacial para investigação operacional de recapes em São Paulo.", "Contexto e engenharia")
-    first, second = st.columns(2, gap="large")
-    with first:
-        st.markdown("#### Problema")
-        st.write("Equipes operacionais recebem notificações e mantêm recapes em bases fragmentadas. Validar a relação entre ambos exigia consultar fontes separadas, interpretar nomes divergentes, localizar trechos e verificar o estado da obra manualmente.")
-        st.markdown("#### Antes")
-        st.write("Consulta de bases isoladas → comparação de nomes e endereços → interpretação de trechos → validação de status → consolidação manual.")
-    with second:
-        st.markdown("#### Solução")
-        st.write("O pipeline corrige encoding, normaliza logradouros e cruza notificações com recapes. Para os trechos, usa segmentos reais do GeoSampa, grafo topológico, roteamento, validação de extensão e diagnóstico explícito de falhas.")
-        st.markdown("#### Diferencial técnico")
-        st.write("STRtree para busca espacial, NetworkX por logradouro, cache persistente com invalidação por assinatura, multiprocessamento, caminho escolhido pela extensão esperada e nenhum recape descartado silenciosamente.")
-
-    st.markdown("#### Caso técnico real, com dados mascarados")
-    case = _real_case(data.recapes)
-    if case is None:
-        empty_state("Nenhum trecho roteado disponível", "A demonstração de caso aparece quando recape_clean.csv contém uma geometria válida.")
-    else:
-        technical = pd.DataFrame([
-            ("Identificador", mascarar(case.get("id"))),
-            ("Via normalizada", mascarar(case.get("rua_norm"), manter=7)),
-            ("Método de resolução", texto(case.get("resolucao_via"))),
-            ("Status da rota", texto(case.get("status_path"))),
-            ("Segmentos", numero(case.get("segment_count_path"))),
-            ("Extensão esperada", f"{numero(case.get('extensao_m'))} m"),
-            ("Extensão calculada", f"{numero(case.get('comprimento_path_m'))} m"),
-            ("Desvio", percentual(case.get("desvio_extensao_pct"))),
-            ("Resultado", "Geometria final baseada em segmentos reais"),
-        ], columns=["Evidência", "Valor"])
-        st.dataframe(technical, use_container_width=True, hide_index=True)
-        st.caption("Identificadores e nomes de via são parcialmente mascarados nesta página. A auditoria operacional continua disponível localmente para usuários autorizados.")
-
-    third, fourth = st.columns(2, gap="large")
-    with third:
-        st.markdown("#### Limitações reais")
-        st.write("A qualidade depende das fontes; há nomes divergentes, coordenadas ausentes e inconsistências de trecho. A interface é Streamlit local, não possui persistência multiusuário e usa CSVs como camada de armazenamento.")
-    with fourth:
-        st.markdown("#### Próximos passos")
-        st.write("PostgreSQL/PostGIS, API FastAPI, dbt, orquestração, autenticação, auditoria multiusuário, histórico de runs e testes de regressão geoespacial.")
+    section_title("Limites atuais", "honestidade operacional")
+    st.info("O lookup por número usa faixas de numeração GeoSampa, não um ponto predial exato. A superfície é conhecida no nível do registro de recape, não como join universal por segmento. A data de notificação não é data de execução.")

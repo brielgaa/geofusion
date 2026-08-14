@@ -180,8 +180,8 @@ def render_operational_map(records: pd.DataFrame, recapes: pd.DataFrame, key_pre
     selected_case_id: str | None = None
     with panel:
         st.markdown("<div class='section-kicker'>Camadas e investigação</div>", unsafe_allow_html=True)
-        show_convias = st.checkbox("Notificações Convias", value=True, key=f"{key_prefix}_convias")
-        show_156 = st.checkbox("Notificações 156", value=True, key=f"{key_prefix}_156")
+        show_convias = st.checkbox("Notificações — fonte A", value=True, key=f"{key_prefix}_convias")
+        show_156 = st.checkbox("Notificações — fonte B", value=True, key=f"{key_prefix}_156")
         show_recent = st.checkbox("Recapes concluídos recentes", value=True, key=f"{key_prefix}_recent")
         show_old = st.checkbox("Recapes concluídos antigos", value=False, key=f"{key_prefix}_old")
         show_planned = st.checkbox("Recapes planejados", value=True, key=f"{key_prefix}_planned")

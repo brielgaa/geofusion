@@ -7,8 +7,18 @@ from dashboard.utils.formatting import escapar
 
 def page_header(title: str, description: str, eyebrow: str | None = None) -> None:
     kicker = f'<div class="section-kicker">{escapar(eyebrow)}</div>' if eyebrow else ""
+    page_key = {
+        "Home": "home",
+        "Consulta de Via": "query",
+        "Proteção de Recapes": "protection",
+        "Mapa": "map",
+        "Auditoria": "audit",
+        "Qualidade": "quality",
+        "Pipeline": "pipeline",
+        "Sobre": "about",
+    }.get(title, "page")
     st.markdown(
-        f'<div class="page-header">{kicker}<h1>{escapar(title)}</h1><p>{escapar(description)}</p></div>',
+        f'<div class="page-header page-header--{page_key}">{kicker}<h1>{escapar(title)}</h1><p>{escapar(description)}</p></div>',
         unsafe_allow_html=True,
     )
 

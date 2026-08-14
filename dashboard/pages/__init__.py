@@ -1,1 +1,1 @@
-"""Páginas da aplicação Obras SP."""
+"""Páginas da aplicação GeoFusion."""

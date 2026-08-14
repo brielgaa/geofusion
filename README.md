@@ -1,172 +1,205 @@
-# Obras SP
+# GeoFusion
 
-Auditoria geoespacial de notificações e recapeamentos em São Paulo. O projeto transforma fontes operacionais fragmentadas em uma fila de investigação: cada notificação pode ser analisada contra um recape associado, sua confiança de match e as evidências técnicas de roteamento.
+Operational geospatial reconstruction, audit and resurfacing intelligence platform.
 
-> Os dados ficam fora do versionamento. O repositório contém o pipeline e a interface; screenshots com informações operacionais não são publicados por privacidade.
+GeoFusion resolves inconsistent street records, reconstructs resurfacing segments against São Paulo's road network, validates geometry through independent evidence, and exposes the result through an operational dashboard.
 
-## Visão geral
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Tests](https://img.shields.io/badge/tests-375%20passing-2ea44f)](https://docs.pytest.org/)
 
-O dashboard Streamlit organiza a operação em seis áreas:
+> Public-release note: operational inputs, generated outputs, caches and review artifacts are intentionally excluded from the repository. See [the local data boundary](data/README.md) before running a public copy.
 
-- Visão geral: cobertura, fluxo de matching, perdas no roteamento e regionais críticas.
-- Auditoria: filtros, fila paginada, exportação e detalhe do caso.
-- Mapa: notificações, recapes roteados e camadas semânticas.
-- Pipeline: arquitetura, estado dos artefatos e etapas de engenharia.
-- Qualidade dos dados: confiança, distância, falhas topológicas e exportação.
-- Sobre o projeto: contexto técnico e limitações reais.
+## What it does
 
-A interface usa exclusivamente o tema escuro, com tokens visuais centralizados e cores reservadas para semântica operacional.
+GeoFusion is an evidence-driven operational system that:
 
-## Problema
+- normalizes resurfacing and notification records;
+- resolves streets using exact, alias, fuzzy, contextual and geographic evidence;
+- reconstructs route segments over a road graph;
+- keeps official geometry separate from shadow reconstruction;
+- validates candidates through independent geometry evidence;
+- audits boundary and street-name contradictions;
+- preserves provenance, confidence and warnings;
+- provides street, number, coordinate, record, surface and protection lookups.
 
-Notificações do SGZ 156 e Convias e informações de recapeamento chegam em bases independentes. O processo manual exige comparar endereços com grafias diferentes, localizar trechos, interpretar os limites `De`/`Até`, verificar o status de obra e consolidar o resultado sem uma trilha de evidências única.
+The product is not presented as an AI project, a generic dashboard or an academic prototype. Its focus is geospatial engineering, data reconciliation, validation and operational auditability.
 
-## Solução
+## Why this problem is hard
 
-O ETL normaliza os dados, realiza o matching de notificações com recapes e roteia os trechos sobre os segmentos reais do GeoSampa. A interface não altera decisões do pipeline: ela expõe o resultado, sinaliza matches que exigem revisão e permite investigar cada caso sem fingir que há persistência multiusuário.
+Operational records rarely describe a road segment in a single consistent language. They may contain abbreviated or misspelled names, missing or conflicting `De`/`Até` boundaries, incomplete geometry, different coordinate systems, disconnected road-network components, and source snapshots that disagree.
+
+GeoFusion therefore treats matching as an evidence problem rather than a simple fuzzy-string search. A candidate can carry method, confidence, token coverage, geographic distance, topology status, boundary evidence, warnings and review requirements. Ambiguity remains visible instead of being silently promoted.
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    A[SGZ 156] --> D[Ingestão]
-    B[SGZ Convias] --> D
-    C[Recapes] --> D
-    D --> E[Correção de encoding e normalização]
-    E --> F[Matching]
-    G[Segmentos GeoSampa] --> H[Grafo topológico]
-    H --> F
-    F --> I[Diagnóstico]
-    I --> J[CSVs processados e cache]
-    J --> K[Dashboard Obras SP]
+    A[Operational records] --> B[Normalization and ETL]
+    B --> C[Street resolution]
+    C --> D[Road graph]
+    D --> E[Route reconstruction]
+    E --> F[Independent geometry validation]
+    F --> G[Boundary and name audits]
+    G --> H[Consensus evidence]
+    H --> I[Operational services]
+    I --> J[Streamlit dashboard]
 ```
 
-## Arquitetura
+The official ETL remains separate from diagnostic, shadow and human-review outputs. The dashboard consumes the operational layer without promoting shadow evidence into the official resurfacing dataset.
+
+## Geometry confidence model
+
+| Tier | Meaning | Operational interpretation |
+| --- | --- | --- |
+| **Official** | Geometry is present in the official resurfacing source. | The source geometry is shown as official. |
+| **Shadow · high / medium** | A reconstructed candidate has stronger diagnostic evidence. | Useful for investigation; never equivalent to official geometry. |
+| **Estimated** | A candidate is available, but evidence is insufficient for a stronger tier. | Visible with uncertainty and provenance. |
+| **Unresolved** | No usable geometry was promoted for the record. | The absence is preserved as a result. |
+
+Shadow quality and Consensus are separate evidence streams. Consensus remains shadow-only in the current release: no official promotions were applied.
+
+## Operational dashboard
+
+The dashboard includes:
+
+- **Home** — collection summary, geometry tiers, protection status and search entry point;
+- **Consulta de Via** — street, number, coordinate or resurfacing-ID lookup with explicit alternatives;
+- **Proteção de Recapes** — `ACTIVE`, `EXPIRING_SOON`, `EXPIRED` and `UNKNOWN_DATE` queues;
+- **Mapa** — quality and protection layers with operational filters;
+- **Auditoria** — official, reconstruction, validator, boundary/name and Consensus evidence;
+- **Qualidade** — deterministic aggregates from the loaded artifacts;
+- **Pipeline / Sobre** — technical flow, artifacts, limitations and product guardrails.
+
+See [Operational Dashboard](docs/operational-dashboard.md) for the page-level contracts.
+
+## Current results
+
+The following values come from the current local operational artifacts and dashboard classification:
+
+| Operational quality tier | Records | Share |
+| --- | ---: | ---: |
+| Official geometry | 1,577 | 31.4% |
+| Shadow · high / medium | 445 | 8.9% |
+| Estimated | 2,121 | 42.2% |
+| Unresolved | 879 | 17.5% |
+| **Total resurfacing records** | **5,022** | **100.0%** |
+
+These tiers are mutually exclusive in the dashboard. `Official + shadow high/medium` is a stronger evidence grouping, not a claim of official coverage. Diagnostic reports use their own scope and must not be added to these counts without checking overlap.
+
+Additional availability indicators:
+
+- **Surface attribute availability:** 3,289 / 5,022 records, approximately 65.5%. This is not geometry coverage.
+- **Street-number lookup support:** approximately 92.0% of 217,212 road segments have number ranges. This is lookup support, not address accuracy.
+- **Protection:** status uses the explicit resurfacing completion date when available. Notification receipt dates are never substituted as execution dates.
+
+## Consensus evidence
+
+The current Consensus artifact is `SHADOW_ONLY` and records no official promotions:
+
+| Consensus class | Records |
+| --- | ---: |
+| `CONSENSUS_HIGH` | 0 |
+| `CONSENSUS_MEDIUM` | 20 |
+| `CONFLICTING_EVIDENCE` | 1,877 |
+| `INSUFFICIENT_EVIDENCE` | 2,514 |
+| `REJECTED_BY_CONSENSUS` | 611 |
+
+The Consensus layer is deliberately not conflated with the geometry-quality shadow layer. Read [Consensus Evidence](docs/consensus-evidence.md) for its evidence families and limitations.
+
+## Performance
+
+GeoFusion uses a persisted SQLite text index for the street lookup path. It contains 217,212 segments and is approximately 53.4 MB. Geometry WKB remains lazy for textual lookup; coordinate lookup keeps the separate spatial path.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Cold street + number | ~20.01 s | ~2.20 ms |
+| Process total for street + number | ~21.76 s | ~1.30 s |
+| RSS after street + number | ~765.6 MB | ~114.3 MB |
+| Semantic equivalence sample | — | 1,000 / 1,000 |
+
+Coordinate lookup is intentionally not represented as a text-index speedup: the measured spatial path remains approximately 19 seconds because it initializes the heavier spatial resources.
+
+See [Operational Performance](docs/operational-performance.md) for the benchmark, equivalence audit and deterministic index-build procedure.
+
+## Tech stack
+
+Python, Pandas, GeoPandas, Shapely, PyProj, NetworkX, RapidFuzz, SQLite, Streamlit, PyDeck and Pytest.
+
+## Quick start
+
+The repository is tested on Python 3.11+.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pytest -q
+```
+
+To build the persisted text index when the required local source data is available:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.operational.build_lookup_index --root . --benchmark
+```
+
+To open the dashboard:
+
+```powershell
+.\.venv\Scripts\streamlit.exe run dashboard/app.py
+```
+
+## Data requirements
+
+Operational inputs are not shipped. A complete local run expects source files under `data/raw/` and generated artifacts under `data/processed/` and `data/cache/`. Those directories may contain addresses, coordinates, work-order identifiers, internal source extracts, downloaded images, checkpoints or human-review decisions.
+
+Do not copy those directories into a public repository. A sanitized demo dataset is not included in v1.0; creating one is a future release task that requires explicit data-ownership review.
+
+## Repository structure
 
 ```text
-obras-sp-pipeline/
-├── dashboard/
-│   ├── app.py
-│   ├── components/       # cards, filtros, gráficos, mapa e detalhe do caso
-│   ├── pages/            # visão geral, auditoria, mapa, pipeline, qualidade e case
-│   ├── services/         # carregamento resiliente e métricas puras
-│   ├── styles/           # tokens e CSS com seletores específicos
-│   └── utils/            # formatação e códigos semânticos de status
-├── src/
-│   ├── transform.py      # ETL, matching, relatório de run e persistência
-│   └── road_graph.py     # RoadGraph, STRtree, cache e roteamento
-├── tests/
-│   ├── test_normalization.py
-│   ├── test_matching.py
-│   ├── test_metrics.py
-│   ├── test_failures.py
-│   └── test_road_graph.py
-├── data/
-│   ├── raw/              # entradas locais, não versionadas
-│   ├── processed/        # saídas do ETL, não versionadas
-│   └── cache/            # GeoJSON e grafo persistente, não versionados
-├── requirements.txt
-└── README.md
+geofusion/
+├── dashboard/          Streamlit operational product
+├── src/                geospatial, audit and operational engines
+│   ├── operational/    persisted lookup and operational services
+│   └── image_geometry/ archived audit-only research
+├── tests/              regression and semantic tests
+├── docs/               architecture, operations and evidence notes
+├── data/config/        tracked configuration
+└── data/               local inputs and generated artifacts; not public
 ```
 
-## Fluxo do pipeline
+## Validation
 
-1. Lê `sgz_156.csv`, `sgz_convias.csv` e `recape.xlsx` ou `recape.csv`.
-2. Corrige texto com encoding corrompido quando identificável.
-3. Normaliza CEP, data, coordenadas e nome de logradouro.
-4. Obtém ou reutiliza `segmento_logradouro` do GeoSampa.
-5. Constrói ou lê um grafo topológico persistente.
-6. Roteia cada recape entre `De` e `Até`.
-7. Cruza notificações e recapes.
-8. Gera arquivos processados, relatório de cobertura, falhas detalhadas e o estado da execução atual.
+- 375 tests pass locally.
+- Python modules compile successfully with `compileall`.
+- The persisted index has a valid metadata contract and deterministic build artifacts.
+- The lookup equivalence sample is 1,000 / 1,000 with zero mismatches.
+- Protected-core hashes remain unchanged across the operational dashboard work.
 
-O arquivo opcional `data/processed/pipeline_run.json` é sobrescrito a cada execução bem-sucedida. Ele descreve o estado atual, durações por etapa, contagens, cache e workers configurados; não simula um histórico de observabilidade inexistente.
+Validation is evidence about the tested artifacts and scenarios. It is not a claim of 100% accuracy or universal production readiness.
 
-## Roteamento GeoSampa
+## Limitations
 
-`src/road_graph.py` constrói um grafo por logradouro a partir de segmentos reais. As extremidades são nós; cada segmento é uma aresta com geometria e comprimento. Para cada recape, o processo:
+- Official geometry currently covers 31.4% of resurfacing records; reconstructed tiers are not official geometry.
+- Estimated geometry is not equivalent to independently validated geometry.
+- Execution date is not universally available; notification receipt is not treated as execution.
+- Coordinate lookups initialize heavier spatial resources than text lookups.
+- Operational datasets may not be redistributable.
+- An experimental image-geometry branch was evaluated through controlled feasibility studies and archived after failing the evidence threshold required for integration.
 
-- resolve a via por CODLOG, nome exato ou fallback fuzzy;
-- encontra as interseções de `De` e `Até` com `STRtree`;
-- valida se os nós pertencem ao mesmo componente conectado;
-- avalia caminhos simples e escolhe o mais próximo da extensão esperada;
-- concatena somente segmentos originais, sem gerar linhas aproximadas.
+## Documentation
 
-O cache em `data/cache/geosampa_road_graph.pkl` inclui assinatura do GeoJSON. Quando tamanho ou data de modificação do arquivo de origem mudam, o cache é invalidado.
+- [Architecture](docs/architecture.md)
+- [Data flow](docs/data-flow.md)
+- [Running](docs/running.md)
+- [Operational dashboard](docs/operational-dashboard.md)
+- [Operational performance](docs/operational-performance.md)
+- [Consensus evidence](docs/consensus-evidence.md)
+- [Consensus calibration](docs/consensus-calibration.md)
+- [Geometry validation](docs/geometry-validation.md)
+- [Boundary contradiction audit](docs/boundary-contradictions.md)
+- [Boundary name recovery](docs/boundary-name-recovery.md)
 
-## Estratégia de matching
+## License
 
-O cruzamento atual usa uma cascata conservadora:
-
-1. compara nomes normalizados com `RapidFuzz` (`token_sort_ratio`, limite 85);
-2. desempata pelo mesmo CEP ou por distância de até 0,3 km;
-3. aceita somente nome quando o score é pelo menos 90;
-4. mantém `SEM_COBERTURA` quando não encontra evidência suficiente.
-
-Os CSVs novos persistem códigos semânticos, como `CONCLUIDO`, `PLANEJADO`, `EM_ANDAMENTO` e `SEM_COBERTURA`. `REVISAO` é uma sinalização de interface para matches fracos, não uma alteração de regra de negócio do ETL. CSVs legados com emojis ainda são interpretados pelo dashboard.
-
-## Diagnóstico de falhas
-
-Nenhum recape sem geometria é descartado silenciosamente. O pipeline classifica, entre outras, as causas:
-
-- `CODLOG_INEXISTENTE`
-- `SEM_RUA` / `FUZZY_NAO_RESOLVEU`
-- `SEM_INTERSECAO_DE`
-- `SEM_INTERSECAO_ATE`
-- `SEM_CAMINHO`
-- `GEOMETRIA_INVALIDA`
-
-As evidências ficam em `data/processed/recapes_sem_cobertura.csv`, com via, CODLOG, segmentos, interseções, componente, caminho e mensagem detalhada. O resumo agregado é salvo em `geosampa_coverage_report.json`.
-
-## Stack
-
-- Python, pandas e openpyxl
-- GeoPandas, Shapely e pyproj
-- NetworkX e STRtree
-- RapidFuzz
-- Streamlit, Plotly e Pydeck
-- pytest
-
-## Como executar
-
-Pré-requisito: Python 3.11+ e ambiente virtual funcional.
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-python src/transform.py
-streamlit run dashboard/app.py
-```
-
-Em Windows, feche arquivos abertos dentro de `data/raw/` antes de executar o ETL.
-
-## Testes
-
-```bash
-pytest -q
-```
-
-Os testes cobrem normalização, correção de encoding, matching, códigos de situação, métricas em DataFrame vazio, diagnóstico de falhas, rota por segmentos reais, componentes desconectados e invalidação de cache.
-
-## Privacidade e LGPD
-
-As fontes podem conter número de OS, endereço, coordenadas e informações operacionais. Por isso, `data/raw/`, `data/processed/` e `data/cache/` estão no `.gitignore`. Antes de qualquer publicação, revise os dados, anonimização, base legal e política de retenção. A página “Sobre o projeto” mascara identificadores e nomes de vias no caso técnico exibido.
-
-## Limitações
-
-- O resultado depende da qualidade e completude das fontes.
-- Nomes divergentes, coordenadas ausentes e trechos mal preenchidos podem reduzir a cobertura.
-- O dashboard Streamlit é local e não possui autenticação nem persistência multiusuário.
-- CSVs são uma camada de armazenamento de demonstração, não um sistema transacional.
-- O mapa mostra amostragem determinística para manter o navegador responsivo; métricas e tabelas usam o recorte completo.
-
-## Roadmap
-
-- PostgreSQL/PostGIS e API FastAPI
-- dbt e orquestração
-- autenticação e auditoria multiusuário
-- histórico de execuções
-- testes de regressão geoespacial e observabilidade centralizada
-
-## Autor
-
-Gabriel Bitencourt
+No software license is selected in this release candidate. Add a license only after ownership and publication authority have been confirmed.

@@ -1,1 +1,1 @@
-"""Aplicação Streamlit de auditoria operacional Obras SP."""
+"""Aplicação Streamlit de auditoria operacional GeoFusion."""
