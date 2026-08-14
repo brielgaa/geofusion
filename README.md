@@ -5,7 +5,7 @@ Operational geospatial reconstruction, audit and resurfacing intelligence platfo
 GeoFusion resolves inconsistent street records, reconstructs resurfacing segments against São Paulo's road network, validates geometry through independent evidence, and exposes the result through an operational dashboard.
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-375%20passing-2ea44f)](https://docs.pytest.org/)
+[![CI](https://github.com/brielgaa/geofusion/actions/workflows/ci.yml/badge.svg)](https://github.com/brielgaa/geofusion/actions/workflows/ci.yml)
 
 > Public-release note: operational inputs, generated outputs, caches and review artifacts are intentionally excluded from the repository. See [the local data boundary](data/README.md) before running a public copy.
 
@@ -133,8 +133,10 @@ The repository is tested on Python 3.11+.
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m pytest -q
+python -m pytest -q -m "not private_data"
 ```
+
+The public command exercises tests that do not require private operational artifacts. With the complete local dataset available, run the full suite with `python -m pytest -q`.
 
 To build the persisted text index when the required local source data is available:
 
@@ -170,7 +172,8 @@ geofusion/
 
 ## Validation
 
-- 375 tests pass locally.
+- Public CI: 319 tests pass without private operational artifacts; 8 private-data tests are intentionally deselected.
+- Full local validation: 375 tests pass with the complete local operational artifacts.
 - Python modules compile successfully with `compileall`.
 - The persisted index has a valid metadata contract and deterministic build artifacts.
 - The lookup equivalence sample is 1,000 / 1,000 with zero mismatches.

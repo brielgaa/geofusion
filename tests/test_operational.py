@@ -5,6 +5,7 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from shapely.geometry import LineString, Point, mapping
 from shapely.ops import transform
 
@@ -295,6 +296,7 @@ def test_serialization(tmp_path):
     assert json.dumps(payload, ensure_ascii=False)
 
 
+@pytest.mark.private_data
 def test_inventory_report_exists_after_discovery():
     path = Path("data/processed/operational_data_capabilities.json")
     assert path.exists()

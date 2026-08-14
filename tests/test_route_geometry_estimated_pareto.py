@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from route_geometry_estimated_pareto import (
     EXPECTED_ESTIMATED,
@@ -134,6 +135,7 @@ def test_scenario_aggressive_adds_part_of_medium():
     assert result["scenarios"]["AGRESSIVO"]["potentially_promoted"] == 2
 
 
+@pytest.mark.private_data
 def test_actual_population_reconciles_same_transversal_promotions():
     cases, reconciliation = load_effective_estimated_cases()
     assert len(cases) == EXPECTED_ESTIMATED
@@ -143,6 +145,7 @@ def test_actual_population_reconciles_same_transversal_promotions():
     assert reconciliation["same_transversal_promoted_medium"] == 10
 
 
+@pytest.mark.private_data
 def test_human_review_is_joined_and_small_sample_is_visible():
     cases, _ = load_effective_estimated_cases()
     reviewed = cases[cases["review_decision"].fillna("").ne("")]
@@ -150,6 +153,7 @@ def test_human_review_is_joined_and_small_sample_is_visible():
     assert int(reviewed["review_approved"].map(lambda value: str(value).lower() == "true").sum()) == 1
 
 
+@pytest.mark.private_data
 def test_analysis_outputs_have_one_line_per_estimated_and_expected_columns(tmp_path):
     output_report = tmp_path / "report.json"
     output_pareto = tmp_path / "pareto.csv"
@@ -164,6 +168,7 @@ def test_analysis_outputs_have_one_line_per_estimated_and_expected_columns(tmp_p
     assert json.loads(output_report.read_text(encoding="utf-8"))["official_outputs_changed"] is False
 
 
+@pytest.mark.private_data
 def test_analysis_is_deterministic(tmp_path):
     first = run_analysis(
         pareto_path=tmp_path / "one_pareto.csv",

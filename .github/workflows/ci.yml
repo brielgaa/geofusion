@@ -17,4 +17,4 @@ jobs:
       - name: Compile Python modules
         run: python -m compileall -q src dashboard tests
       - name: Run tests
-        run: python -m pytest -q
+        run: python -m pytest -q -m "not private_data"
