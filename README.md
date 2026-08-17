@@ -163,7 +163,6 @@ geofusion/
 ├── dashboard/          Streamlit operational product
 ├── src/                geospatial, audit and operational engines
 │   ├── operational/    persisted lookup and operational services
-│   └── image_geometry/ archived audit-only research
 ├── tests/              regression and semantic tests
 ├── docs/               architecture, operations and evidence notes
 ├── data/config/        tracked configuration
@@ -188,7 +187,6 @@ Validation is evidence about the tested artifacts and scenarios. It is not a cla
 - Execution date is not universally available; notification receipt is not treated as execution.
 - Coordinate lookups initialize heavier spatial resources than text lookups.
 - Operational datasets may not be redistributable.
-- An experimental image-geometry branch was evaluated through controlled feasibility studies and archived after failing the evidence threshold required for integration.
 
 ## Documentation
 
@@ -205,4 +203,4 @@ Validation is evidence about the tested artifacts and scenarios. It is not a cla
 
 ## License
 
-No software license is selected in this release candidate. Add a license only after ownership and publication authority have been confirmed.
+No software license is currently provided.

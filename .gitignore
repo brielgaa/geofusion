@@ -71,3 +71,34 @@ OneDriveTemp/
 # Local notebooks and exports
 .ipynb_checkpoints/
 *.ipynb
+
+# Local-only research and publication-audit working files
+docs/caching-and-checkpoints.md
+docs/corporate-release-checklist.md
+docs/estimated-analysis.md
+docs/image-geometry-feasibility.md
+docs/image-geometry-v2.md
+docs/map-registration-feasibility.md
+docs/metric-authority-audit.md
+docs/open-source-readiness.md
+docs/operational-data-layer.md
+docs/public-release-audit.md
+docs/public-release-checklist.md
+docs/public-release-file-inventory.csv
+docs/public-release-final-report.md
+docs/public-release-history-audit.md
+docs/public-release-manifest.md
+docs/repository-cleanup-report.md
+docs/route-geometry-review.md
+docs/smartsub-image-coverage-audit.md
+docs/street-resolution-review.md
+docs/street-resolution.md
+docs/screenshots/
+scripts/metric_authority_audit.py
+scripts/public_release_audit.py
+src/image_geometry/
+src/smartsub_coverage_audit.py
+tests/test_image_geometry.py
+tests/test_image_geometry_v2.py
+tests/test_map_registration.py
+tests/test_smartsub_coverage_audit.py
